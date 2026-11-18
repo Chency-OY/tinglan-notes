@@ -73,6 +73,33 @@ def wave_image():
     return ctk.CTkImage(im, size=(90, 32))
 
 
+def sidebar_icon():
+    im = Image.new("RGBA", (88, 88))
+    pen = ImageDraw.Draw(im)
+    pen.rounded_rectangle((8, 14, 80, 74), radius=15, outline="#898E97", width=6)
+    pen.line((32, 17, 32, 71), fill="#898E97", width=5)
+    return ctk.CTkImage(im, size=(22, 22))
+
+
+def history_action_icons():
+    stroke = "#858990"
+    edit = Image.new("RGBA", (88, 88))
+    pen = ImageDraw.Draw(edit)
+    pen.rounded_rectangle((9, 17, 70, 77), radius=13, outline=stroke, width=5)
+    pen.rectangle((36, 7, 78, 46), fill=(0, 0, 0, 0))
+    pen.line([(30, 55), (33, 43), (61, 15), (66, 13), (71, 17),
+              (72, 22), (43, 52), (30, 55)], fill=stroke, width=5, joint="curve")
+    trash = Image.new("RGBA", (88, 88))
+    pen = ImageDraw.Draw(trash)
+    pen.rounded_rectangle((33, 13, 55, 25), radius=5, outline=stroke, width=5)
+    pen.line((14, 25, 74, 25), fill=stroke, width=5)
+    pen.line([(22, 26), (26, 70), (30, 75), (58, 75), (62, 70), (66, 26)],
+             fill=stroke, width=5, joint="curve")
+    for x in (37, 51):
+        pen.line((x, 36, x, 62), fill=stroke, width=4)
+    return [ctk.CTkImage(im, size=(19, 19)) for im in (edit, trash)]
+
+
 class InterpreterWindow(ctk.CTk):
     capture = AudioBackend.capture
 
@@ -91,7 +118,7 @@ class InterpreterWindow(ctk.CTk):
         self.priority = priority_order(self.history_store.preference("priority", "DeepSeek|Kimi 订阅|腾讯云"))
         self.float_enabled = ctk.BooleanVar(value=self.history_store.preference("overlay", "1") == "1")
         self.overlay = None
-        self.float_text = ctk.StringVar(value="等待语音…")
+        self.ball_position = None
         self.draft_title = ""
         self.session_id = self.view_id = None
         self.recording = self.closing = False
@@ -113,6 +140,7 @@ class InterpreterWindow(ctk.CTk):
         portrait = Image.open(ASSETS / "icon.png").convert("RGBA")
         self.orbs = [orb_image(portrait, active) for active in (False, True)]
         self.wave = wave_image()
+        self.edit_icon, self.delete_icon = history_action_icons()
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
         self.side = ctk.CTkFrame(self, width=204, corner_radius=0, fg_color=SIDE)
@@ -128,12 +156,14 @@ class InterpreterWindow(ctk.CTk):
         self.bind("<Control-MouseWheel>", self._zoom)
         self.bind("<Escape>", lambda _: self.set_panel(None))
         self.bind("<Control-b>", lambda _: self.toggle_history())
+        self.after_idle(self.update_overlay)
         self.after(80, self.poll)
 
     def _build_header(self):
         bar = ctk.CTkFrame(self.main, fg_color="transparent")
         bar.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 0))
-        self.history_toggle = button(bar, "历史", self.toggle_history, 50, fill="#EEF2FA")
+        self.history_toggle = button(bar, "", self.toggle_history, 34)
+        self.history_toggle.configure(image=sidebar_icon(), corner_radius=7)
         self.history_toggle.pack(side="left", padx=(0, 10))
         title_box = ctk.CTkFrame(bar, fg_color="transparent")
         title_box.pack(side="left", fill="x", expand=True)
@@ -198,7 +228,6 @@ class InterpreterWindow(ctk.CTk):
         self.action = label(strip, "", 12, SUB, anchor="w")
         self.action.pack(side="left", fill="x", expand=True, padx=(0, 5))
         self.live_link = button(strip, "回到录制", lambda: self.select_session(self.session_id), 68, fill=SELECT)
-        self.float_link = button(strip, "悬浮字幕", self.reopen_overlay, 72)
         self.orb = ctk.CTkButton(dock, text="", image=self.orbs[0], width=66, height=66, corner_radius=6,
                                  border_spacing=0, fg_color="transparent", hover_color="#E7ECF9", command=self.toggle)
         self.orb.grid(row=1, column=1)
@@ -213,12 +242,8 @@ class InterpreterWindow(ctk.CTk):
         text = "正在保存…" if stopping else "点击头像暂停" if self.recording else "点击头像继续" if self.view_id else "点击头像录制"
         self.action.configure(text=text)
         self.orb.configure(image=self.orbs[int(self.recording)], state="disabled" if stopping else "normal")
-        if self.recording:
-            self.float_link.pack(side="right")
-        else:
-            self.float_link.pack_forget()
         if self.overlay is not None:
-            self.float_orb.configure(image=self.orbs[int(self.recording)], state="disabled" if stopping else "normal")
+            self.float_canvas.itemconfigure(self.float_face, image=self.float_images[int(self.recording)])
         if self.recording and self.view_id != self.session_id:
             self.action.pack_forget()
             self.live_link.pack(side="left")
@@ -235,46 +260,53 @@ class InterpreterWindow(ctk.CTk):
             self.overlay.destroy()
             self.overlay = None
 
-    def reopen_overlay(self):
-        self.float_enabled.set(True)
-        self.update_overlay()
-
     def update_overlay(self):
-        if not self.float_enabled.get() or not self.recording:
+        if not self.float_enabled.get():
             self.close_overlay()
             return
         if self.overlay is not None:
             return
-        win = self.overlay = ctk.CTkToplevel(self, fg_color=PAPER)
-        win.title("录制字幕")
+        # Use a colour-keyed window: the only visible and clickable surface is the portrait.
+        chroma = "#FF00FF"
+        win = self.overlay = tk.Toplevel(self, background=chroma, takefocus=False)
+        win.withdraw()
+        win.title("录制悬浮球")
+        win.overrideredirect(True)
         win.attributes("-toolwindow", True)
+        win.attributes("-transparentcolor", chroma)
         win.attributes("-topmost", True)
-        win.attributes("-alpha", self.opacity)
-        win.geometry("395x118")
-        win.minsize(300, 98)
-        win.protocol("WM_DELETE_WINDOW", self.close_overlay)
-        win.grid_columnconfigure(0, weight=1)
-        win.grid_rowconfigure(1, weight=1)
-        label(win, "", 11, MUTED, textvariable=self.status, anchor="w").grid(row=0, column=0, sticky="ew", padx=12, pady=(6, 0))
-        self.float_caption = label(win, "", 15, INK, bold=True, textvariable=self.float_text, anchor="w", justify="left")
-        self.float_caption.grid(row=1, column=0, sticky="nsew", padx=12, pady=(3, 6))
-        self.float_caption.bind("<Configure>", lambda e: self.float_caption.configure(
-            wraplength=max(100, int(e.width / self.float_caption._get_widget_scaling()) - 8)))
-        self.float_orb = ctk.CTkButton(win, text="", width=66, height=66, image=self.orbs[1],
-                                       fg_color="transparent", hover_color=SELECT, command=self.toggle)
-        self.float_orb.grid(row=0, rowspan=2, column=1, padx=(0, 6))
-        if getattr(self, "overlay_position", None):
-            win.geometry(self.overlay_position)
-        else:
-            win.update_idletasks()
-            x = max(0, win.winfo_screenwidth() - win.winfo_width() - 45)
-            y = max(0, win.winfo_screenheight() - win.winfo_height() - 145)
-            win.geometry(f"+{x}+{y}")
-        win.bind("<Configure>", lambda e: self.remember_overlay(e, win))
-
-    def remember_overlay(self, event, win):
-        if event.widget == win and win.winfo_ismapped():
-            self.overlay_position = win.geometry()
+        scale = self.main._get_widget_scaling()
+        size = round(60 * scale)
+        self.float_images = [image.create_scaled_photo_image(scale, "light") for image in self.orbs]
+        canvas = self.float_canvas = tk.Canvas(win, width=size, height=size, bg=chroma, borderwidth=0,
+                                                highlightthickness=0, cursor="hand2", takefocus=False)
+        canvas.pack()
+        self.float_face = canvas.create_image(0, 0, anchor="nw", image=self.float_images[int(self.recording)])
+        x, y = self.ball_position or (max(0, win.winfo_screenwidth() - size - 40),
+                                      max(0, win.winfo_screenheight() - size - 130))
+        win.geometry(f"{size}x{size}+{x}+{y}")
+        def press(event):
+            self.ball_press = (event.x_root, event.y_root, win.winfo_x(), win.winfo_y())
+            self.ball_dragged = False
+        def drag(event):
+            px, py, wx, wy = self.ball_press
+            dx, dy = event.x_root - px, event.y_root - py
+            if self.ball_dragged or max(abs(dx), abs(dy)) >= round(4 * scale):
+                self.ball_dragged = True
+                self.ball_position = (wx + dx, wy + dy)
+                win.geometry(f"+{wx + dx}+{wy + dy}")
+        def release(event):
+            drag(event)
+            if self.ball_dragged or self.closing or (self.recording and self.stop_event.is_set()):
+                return
+            self.toggle()
+            if not self.recording:
+                self.deiconify()
+                self.lift()
+        canvas.bind("<ButtonPress-1>", press)
+        canvas.bind("<B1-Motion>", drag)
+        canvas.bind("<ButtonRelease-1>", release)
+        win.deiconify()
 
     def toggle_settings(self):
         if self.panel == "settings":
@@ -287,7 +319,7 @@ class InterpreterWindow(ctk.CTk):
         self.panel = name
         for child in self.side.winfo_children():
             child.destroy()
-        self.history_toggle.configure(fg_color=SELECT if name == "history" else "#EEF2FA")
+        self.history_toggle.configure(fg_color=SELECT if name == "history" else "transparent")
         self.settings_btn.configure(fg_color=SELECT if name == "settings" else "transparent")
         if name is None:
             self.side.grid_remove()
@@ -331,11 +363,14 @@ class InterpreterWindow(ctk.CTk):
             card = ctk.CTkFrame(self.listing, fg_color=SELECT if sid == self.view_id else "transparent", corner_radius=10)
             card.pack(fill="x", pady=2)
             text = title or date.strftime("%m.%d %H:%M")
-            button(card, text, lambda s=sid: self.select_session(s), anchor="w").pack(fill="x")
-            actions = ctk.CTkFrame(card, fg_color="transparent")
-            actions.pack(fill="x", padx=4)
-            button(actions, "重命名", lambda s=sid: self.rename_from_history(s), 54).pack(side="left")
-            button(actions, "删除", lambda s=sid, a=actions: self.confirm_delete(s, a), 44).pack(side="left")
+            for icon, command in (
+                (self.delete_icon, lambda s=sid, c=card: self.confirm_delete(s, c)),
+                (self.edit_icon, lambda s=sid: self.rename_from_history(s)),
+            ):
+                action = button(card, "", command, 26)
+                action.configure(image=icon, corner_radius=5, border_spacing=0)
+                action.pack(side="right", padx=1)
+            button(card, text, lambda s=sid: self.select_session(s), width=36, anchor="w").pack(side="left", fill="x", expand=True)
 
     def rename_from_history(self, sid):
         self.select_session(sid)
@@ -425,7 +460,7 @@ class InterpreterWindow(ctk.CTk):
         draw_order()
         label(form, "跳过未填密钥的服务。当前服务失败时，本段尝试下一项。", 11, MUTED,
               wraplength=147, justify="left").pack(anchor="w", pady=5)
-        ctk.CTkCheckBox(form, text="录制时显示悬浮窗", variable=self.float_enabled, command=self.update_overlay,
+        ctk.CTkCheckBox(form, text="显示桌面悬浮球", variable=self.float_enabled, command=self.update_overlay,
                         text_color=SUB, font=font(12)).pack(anchor="w", pady=(8, 2))
         caption("窗口透明度")
         slider = ctk.CTkSlider(form, from_=.55, to=1., width=100, button_color=ACCENT, progress_color="#A6B9DF",
@@ -447,8 +482,6 @@ class InterpreterWindow(ctk.CTk):
     def set_opacity(self, value):
         self.opacity = float(value)
         self.attributes("-alpha", self.opacity)
-        if self.overlay is not None:
-            self.overlay.attributes("-alpha", self.opacity)
 
     def save_settings(self):
         try:
@@ -614,7 +647,6 @@ class InterpreterWindow(ctk.CTk):
         self.capture_started = time.time()
         self.status.set("正在收音")
         self._select(sid)
-        self.float_text.set("等待语音…")
         self.update_overlay()
         if self.panel == "settings":
             for menu in self.options:
@@ -651,8 +683,6 @@ class InterpreterWindow(ctk.CTk):
                 if sid is None or not (src or dst):
                     continue
                 self.partial = ("", "") if final else (src, dst)
-                if sid == self.session_id:
-                    self.float_text.set(dst or src)
                 if final:
                     self.history_store.append(sid, start, end, src, dst)
                 if self.view_id == sid:
@@ -667,7 +697,6 @@ class InterpreterWindow(ctk.CTk):
                 self.history_store.end(self.session_id)
                 self.recording = False
                 self.route_keys.clear()
-                self.close_overlay()
                 had_partial = any(self.partial)
                 self.partial = ("", "")
                 if self.view_id == self.session_id and (had_partial or not self.has_text):
