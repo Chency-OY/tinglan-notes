@@ -358,6 +358,7 @@ class Interpreter(tk.Tk):
         dialog.title("会话历史")
         dialog.geometry("790x520")
         dialog.minsize(600, 380)
+        dialog.attributes("-topmost", True)
         dialog.configure(bg="#f7f7ff")
         tk.Label(dialog, text="✦ 会话历史", bg="#f7f7ff", fg="#665b91", font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w", padx=18, pady=(14, 8))
         tree = ttk.Treeview(dialog, columns=("start", "end", "provider"), show="headings", height=7)
@@ -418,6 +419,7 @@ class Interpreter(tk.Tk):
         dialog = tk.Toplevel(self)
         dialog.title("服务密钥")
         dialog.geometry("540x320")
+        dialog.attributes("-topmost", True)
         dialog.configure(bg="#f7f7ff")
         tk.Label(dialog, text="✦ 服务设置", bg="#f7f7ff", fg="#665b91", font=("Microsoft YaHei UI", 15, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", padx=20, pady=(18, 10))
         fields = [("DeepSeek API Key", "deepseek_key"), ("腾讯云 AppID", "tencent_appid"), ("腾讯云 SecretId", "tencent_id"), ("腾讯云 SecretKey", "tencent_key")]
