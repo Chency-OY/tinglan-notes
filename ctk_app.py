@@ -100,6 +100,65 @@ def history_action_icons():
     return [ctk.CTkImage(im, size=(19, 19)) for im in (edit, trash)]
 
 
+class RecordOrb(tk.Canvas):
+    """Only an unmoved short press can toggle. A drag stays a drag until release."""
+
+    def __init__(self, parent, orbs, scale, background, command, on_drag=None):
+        size = round(60 * scale)
+        super().__init__(parent, width=size, height=size, bg=background, borderwidth=0,
+                         highlightthickness=0, takefocus=on_drag is None, cursor="hand2")
+        self.images = [orb.create_scaled_photo_image(scale, "light") for orb in orbs]
+        self.face = self.create_image(0, 0, anchor="nw", image=self.images[0])
+        self.command = command
+        self.on_drag = on_drag
+        self.press_at = None
+        self.enabled = True
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<B1-Motion>", self._motion)
+        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Return>", lambda _: self.invoke())
+        self.bind("<space>", lambda _: self.invoke())
+
+    def set_state(self, recording, enabled):
+        self.enabled = enabled
+        self.itemconfigure(self.face, image=self.images[int(recording)])
+
+    def invoke(self):
+        if self.enabled:
+            self.command()
+
+    def _press(self, event):
+        self.press_at = (event.x_root, event.y_root)
+        self.down_time = time.monotonic()
+        self.press_timestamp = event.time
+        self.dragged = False
+        top = self.winfo_toplevel()
+        self.window_origin = (top.winfo_x(), top.winfo_y())
+        self.grab_set()
+
+    def _motion(self, event):
+        if self.press_at is None:
+            return
+        dx = event.x_root - self.press_at[0]
+        dy = event.y_root - self.press_at[1]
+        if abs(dx) + abs(dy) >= 2:
+            self.dragged = True
+        if self.dragged and self.on_drag:
+            x, y = self.window_origin
+            self.on_drag(x + dx, y + dy)
+
+    def _release(self, event):
+        if self.press_at is None:
+            return
+        self._motion(event)
+        self.press_at = None
+        if self.grab_current() is self:
+            self.grab_release()
+        elapsed_ms = (event.time - self.press_timestamp) & 0xffffffff
+        if not self.dragged and elapsed_ms < 400 and time.monotonic() - self.down_time < .40:
+            self.invoke()
+
+
 class InterpreterWindow(ctk.CTk):
     capture = AudioBackend.capture
 
@@ -228,22 +287,16 @@ class InterpreterWindow(ctk.CTk):
         self.action = label(strip, "", 12, SUB, anchor="w")
         self.action.pack(side="left", fill="x", expand=True, padx=(0, 5))
         self.live_link = button(strip, "回到录制", lambda: self.select_session(self.session_id), 68, fill=SELECT)
-        self.orb = ctk.CTkButton(dock, text="", image=self.orbs[0], width=66, height=66, corner_radius=6,
-                                 border_spacing=0, fg_color="transparent", hover_color="#E7ECF9", command=self.toggle)
-        self.orb.grid(row=1, column=1)
-        tk.Frame.configure(self.orb, takefocus=True)
-        tk.Misc.bind(self.orb, "<Return>", lambda _: self.toggle())
-        tk.Misc.bind(self.orb, "<space>", lambda _: self.toggle())
-        tk.Misc.bind(self.orb, "<FocusIn>", lambda _: self.orb.configure(fg_color=SELECT))
-        tk.Misc.bind(self.orb, "<FocusOut>", lambda _: self.orb.configure(fg_color="transparent"))
+        self.orb = RecordOrb(dock, self.orbs, self.main._get_widget_scaling(), PAPER, self.toggle)
+        self.orb.grid(row=1, column=1, padx=3, pady=3)
 
     def _dock_state(self):
         stopping = self.recording and self.stop_event.is_set()
         text = "正在保存…" if stopping else "点击头像暂停" if self.recording else "点击头像继续" if self.view_id else "点击头像录制"
         self.action.configure(text=text)
-        self.orb.configure(image=self.orbs[int(self.recording)], state="disabled" if stopping else "normal")
+        self.orb.set_state(self.recording, not stopping)
         if self.overlay is not None:
-            self.float_canvas.itemconfigure(self.float_face, image=self.float_images[int(self.recording)])
+            self.float_canvas.set_state(self.recording, not stopping)
         if self.recording and self.view_id != self.session_id:
             self.action.pack_forget()
             self.live_link.pack(side="left")
@@ -277,35 +330,22 @@ class InterpreterWindow(ctk.CTk):
         win.attributes("-topmost", True)
         scale = self.main._get_widget_scaling()
         size = round(60 * scale)
-        self.float_images = [image.create_scaled_photo_image(scale, "light") for image in self.orbs]
-        canvas = self.float_canvas = tk.Canvas(win, width=size, height=size, bg=chroma, borderwidth=0,
-                                                highlightthickness=0, cursor="hand2", takefocus=False)
-        canvas.pack()
-        self.float_face = canvas.create_image(0, 0, anchor="nw", image=self.float_images[int(self.recording)])
-        x, y = self.ball_position or (max(0, win.winfo_screenwidth() - size - 40),
-                                      max(0, win.winfo_screenheight() - size - 130))
-        win.geometry(f"{size}x{size}+{x}+{y}")
-        def press(event):
-            self.ball_press = (event.x_root, event.y_root, win.winfo_x(), win.winfo_y())
-            self.ball_dragged = False
-        def drag(event):
-            px, py, wx, wy = self.ball_press
-            dx, dy = event.x_root - px, event.y_root - py
-            if self.ball_dragged or max(abs(dx), abs(dy)) >= round(4 * scale):
-                self.ball_dragged = True
-                self.ball_position = (wx + dx, wy + dy)
-                win.geometry(f"+{wx + dx}+{wy + dy}")
-        def release(event):
-            drag(event)
-            if self.ball_dragged or self.closing or (self.recording and self.stop_event.is_set()):
+        def move_to(x, y):
+            self.ball_position = (x, y)
+            win.geometry(f"+{x}+{y}")
+        def click():
+            if self.closing:
                 return
             self.toggle()
             if not self.recording:
                 self.deiconify()
                 self.lift()
-        canvas.bind("<ButtonPress-1>", press)
-        canvas.bind("<B1-Motion>", drag)
-        canvas.bind("<ButtonRelease-1>", release)
+        self.float_canvas = RecordOrb(win, self.orbs, scale, chroma, click, move_to)
+        self.float_canvas.set_state(self.recording, not self.stop_event.is_set() or not self.recording)
+        self.float_canvas.pack()
+        x, y = self.ball_position or (max(0, win.winfo_screenwidth() - size - 40),
+                                      max(0, win.winfo_screenheight() - size - 130))
+        win.geometry(f"{size}x{size}+{x}+{y}")
         win.deiconify()
 
     def toggle_settings(self):
