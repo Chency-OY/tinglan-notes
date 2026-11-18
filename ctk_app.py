@@ -1,433 +1,576 @@
-"""One-window, ice-blue desktop UI for live Chinese-English interpretation."""
+"""Single-window conversation workspace for the Windows interpreter."""
 from __future__ import annotations
 
 import queue
 import sys
 import threading
 import time
+import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 import keyring
 import sounddevice as sd
-from PIL import Image
+from PIL import Image, ImageDraw, ImageOps
 
-from interpreter import HistoryStore, Interpreter as AudioBackend, SERVICE, clock_text, SAMPLE_RATE, FRAME_SAMPLES
+from interpreter import FRAME_SAMPLES, SAMPLE_RATE, SERVICE, HistoryStore, Interpreter as AudioBackend, clock_text
 
-
-BG = "#F8FBFF"
-INK = "#35466F"
-MUTED = "#8191B4"
-BLUE = "#6F85BC"
-PALE = "#EDF3FF"
-ICE = "#E3ECFF"
-HOVER = "#E5EDFC"
+PAPER = "#FAFBFE"
+SIDE = "#EEF2FB"
+INK = "#303B59"
+SUB = "#596884"
+MUTED = "#657490"
+ACCENT = "#6278AC"
+SELECT = "#DDE6F8"
+BORDER = "#DEE5F2"
 FONT = "Microsoft YaHei UI"
+ASSETS = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 
 
-def ui_button(master, text, command, *, primary=False, width=92):
-    return ctk.CTkButton(
-        master, text=text, command=command, width=width, height=35, corner_radius=9,
-        fg_color=BLUE if primary else "transparent",
-        hover_color="#5E77B3" if primary else HOVER,
-        text_color="#FFFFFF" if primary else "#526B9B",
-        font=ctk.CTkFont(family=FONT, size=12, weight="bold" if primary else "normal"),
-        border_width=0,
-    )
+def font(size, bold=False, family=FONT):
+    return ctk.CTkFont(family=family, size=size, weight="bold" if bold else "normal")
+
+
+def label(parent, text, size=12, color=INK, bold=False, **kwargs):
+    return ctk.CTkLabel(parent, text=text, height=0, font=font(size, bold), text_color=color, **kwargs)
+
+
+def button(parent, text, command, width=32, *, symbol=False, fill="transparent", anchor="center"):
+    return ctk.CTkButton(parent, text=text, command=command, width=width, height=32,
+                         fg_color=fill, hover_color=SELECT, text_color=SUB, corner_radius=12,
+                         anchor=anchor, font=font(16 if symbol else 12, family="Segoe MDL2 Assets" if symbol else FONT))
+
+
+def orb_image(portrait, recording):
+    # Supersample the portrait, surrounding ring and small play/pause badge as one button.
+    size = 240
+    im = Image.new("RGBA", (size, size))
+    draw = ImageDraw.Draw(im)
+    draw.ellipse((5, 8, 235, 238), fill="#DDE5F7")
+    draw.ellipse((6, 2, 234, 230), fill="#FFFFFF", outline="#8599CA" if recording else "#C7D4EF", width=6)
+    draw.ellipse((18, 14, 222, 218), fill="#E5EBFF")
+    face = ImageOps.contain(portrait, (184, 184), Image.Resampling.LANCZOS)
+    im.alpha_composite(face, ((size - face.width) // 2, 22))
+    draw.ellipse((158, 151, 234, 227), fill="#AD637D" if recording else ACCENT, outline="#FFFFFF", width=7)
+    if recording:
+        for x in (183, 199):
+            draw.rounded_rectangle((x, 176, x + 8, 202), radius=3, fill="white")
+    else:
+        draw.polygon([(188, 175), (188, 204), (209, 190)], fill="white")
+    return ctk.CTkImage(im, size=(60, 60))
+
+
+def wave_image():
+    im = Image.new("RGBA", (360, 128))
+    draw = ImageDraw.Draw(im)
+    heights = (8, 16, 31, 50, 80, 48, 27, 55, 96, 67, 34, 19, 8)
+    for i, height in enumerate(heights):
+        x = 30 + 24 * i
+        color = ("#BACCF1", "#94B1E3", "#96A7DB", "#AEA6D6")[min(i // 4, 3)]
+        draw.rounded_rectangle((x, (128-height)//2, x+12, (128+height)//2), radius=6, fill=color)
+    return ctk.CTkImage(im, size=(90, 32))
 
 
 class InterpreterWindow(ctk.CTk):
     capture = AudioBackend.capture
-    deepseek_loop = AudioBackend.deepseek_loop
-    tencent_loop = AudioBackend.tencent_loop
 
-    def __init__(self):
+    def __init__(self, history_store=None):
         ctk.set_appearance_mode("light")
-        super().__init__(fg_color=BG)
+        super().__init__(fg_color=PAPER)
         self.title("中英同传字幕")
-        icon_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
-        if (icon_dir / "icon.ico").exists():
-            self.iconbitmap(str(icon_dir / "icon.ico"))
-        self.geometry("760x355+300+100")
-        self.minsize(560, 290)
+        self.iconbitmap(str(ASSETS / "icon.ico"))
+        self.geometry("800x460")
+        self.minsize(540, 300)
+        self.opacity = .94
         self.attributes("-topmost", True)
-        self.opacity = .88
         self.attributes("-alpha", self.opacity)
         self.protocol("WM_DELETE_WINDOW", self.close)
-        self.zoom = 1.0
-        self.active_view = "subtitles"
-        self.sidebar_open = False
-        self.selected_session_id = None
-        self.history_store = HistoryStore()
-        self.session_id: int | None = None
-        self.capture_started = 0.0
-        self.events: queue.Queue[tuple] = queue.Queue()
-        self.audio: queue.Queue[bytes] = queue.Queue(maxsize=100)
+        self.history_store = history_store or HistoryStore()
+        self.session_id = self.view_id = None
+        self.recording = self.closing = False
+        self.panel = None
+        self.before_settings = None
+        self.export_folder = ctk.StringVar(value=str(Path.home() / "Documents" / "同传记录"))
+        self.zoom = 1.
+        self.worker = self.stream = None
+        self.capture_started = 0.
         self.stop_event = threading.Event()
-        self.worker: threading.Thread | None = None
-        self.stream = None
-        self.closing = False
-        self.devices = {f"{i}: {d['name']}": i for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0}
-        self.mode = ctk.StringVar(value="DeepSeek 近实时")
+        self.events = queue.Queue()
+        self.audio = queue.Queue(maxsize=100)
+        self.partial = ("", "")
+        self.titled_sessions = set()
+        self.devices = {f"{i} · {d['name']}": i for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0}
         self.device = ctk.StringVar(value=next(iter(self.devices), "无可用麦克风"))
-        self.status = ctk.StringVar(value="未启动")
-        self.icon_image = None
-        if (icon_dir / "icon.png").exists():
-            self.icon_image = ctk.CTkImage(Image.open(icon_dir / "icon.png"), size=(34, 34))
-        self.workspace = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
-        self.workspace.pack(fill="both", expand=True)
-        self.workspace.grid_rowconfigure(0, weight=1)
-        self.workspace.grid_columnconfigure(1, weight=1)
-        self.content = ctk.CTkFrame(self.workspace, fg_color=BG, corner_radius=0)
-        self.content.grid(row=0, column=1, sticky="nsew")
-        self._build_sidebar()
-        self._build_compact()
-        self._build_history()
-        self.bind("<Configure>", self.on_resize)
-        self.bind("<Control-MouseWheel>", self.on_zoom)
+        self.mode = ctk.StringVar(value="DeepSeek 近实时")
+        self.status = ctk.StringVar(value="")
+        portrait = Image.open(ASSETS / "icon.png").convert("RGBA")
+        self.orbs = [orb_image(portrait, active) for active in (False, True)]
+        self.wave = wave_image()
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=1)
+        self.side = ctk.CTkFrame(self, width=204, corner_radius=0, fg_color=SIDE)
+        self.side.pack_propagate(False)
+        self.main = ctk.CTkFrame(self, corner_radius=0, fg_color=PAPER)
+        self.main.grid(row=0, column=1, sticky="nsew")
+        self.main.grid_columnconfigure(0, weight=1)
+        self.main.grid_rowconfigure(1, weight=1)
+        self._build_header()
+        self._build_feed()
+        self._build_dock()
+        self._select(None)
+        self.bind("<Control-MouseWheel>", self._zoom)
+        self.bind("<Escape>", lambda _: self.set_panel(None))
+        self.bind("<Control-b>", lambda _: self.toggle_history())
         self.after(80, self.poll)
 
-    def _build_compact(self):
-        self.compact = ctk.CTkFrame(self.content, fg_color=BG, corner_radius=0)
-        self.compact.pack(fill="both", expand=True)
-        header = ctk.CTkFrame(self.compact, fg_color="transparent")
-        header.pack(fill="x", padx=20, pady=(16, 11))
-        self.history_toggle = ui_button(header, "☰ 历史", self.toggle_sidebar, width=66)
-        self.history_toggle.pack(side="left", padx=(0, 7))
-        if self.icon_image:
-            ctk.CTkLabel(header, text="", image=self.icon_image, width=36).pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(header, text="中英同传", text_color=INK, font=ctk.CTkFont(family=FONT, size=19, weight="bold")).pack(side="left")
-        self.session_label = ctk.CTkLabel(header, text="新会话", text_color=MUTED, font=ctk.CTkFont(family=FONT, size=11))
-        self.session_label.pack(side="left", padx=(10, 0), pady=(4, 0))
-        ui_button(header, "设置", self.show_settings, width=58).pack(side="right", padx=(0, 4))
+    def _build_header(self):
+        bar = ctk.CTkFrame(self.main, fg_color="transparent")
+        bar.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 0))
+        self.history_toggle = button(bar, "历史", self.toggle_history, 50, fill="#EEF2FA")
+        self.history_toggle.pack(side="left", padx=(0, 10))
+        title_box = ctk.CTkFrame(bar, fg_color="transparent")
+        title_box.pack(side="left", fill="x", expand=True)
+        self.heading = label(title_box, "", 16, bold=True, anchor="w")
+        self.heading.pack(fill="x")
+        self.meta = label(title_box, "", 10, MUTED, anchor="w")
+        self.meta.pack(fill="x")
+        self.settings_btn = button(bar, "设置", self.toggle_settings, 44)
+        self.settings_btn.pack(side="right")
+        self.export_btn = button(bar, "导出", lambda: self.set_panel(None if self.panel == "export" else "export"), 44)
+        self.export_btn.pack(side="right")
+        self.new_btn = button(bar, "\ue710", self.new_session, symbol=True)
+        self.new_btn.pack(side="right")
 
-        controls = ctk.CTkFrame(self.compact, fg_color="transparent")
-        controls.pack(fill="x", padx=20, pady=(0, 11))
-        combo = dict(height=37, corner_radius=9, fg_color="#FFFFFF", border_color="#D9E4F7",
-                     button_color="#E8F0FF", button_hover_color="#DAE7FC", text_color=INK,
-                     dropdown_fg_color="#FFFFFF", dropdown_hover_color=HOVER,
-                     font=ctk.CTkFont(family=FONT, size=12))
-        controls.grid_columnconfigure(1, weight=1)
-        self.mode_combo = ctk.CTkComboBox(controls, values=["DeepSeek 近实时", "腾讯云 实时"], variable=self.mode, width=148, **combo)
-        self.mode_combo.grid(row=0, column=0, padx=(0, 7))
-        self.device_combo = ctk.CTkComboBox(controls, values=list(self.devices) or ["无可用麦克风"], variable=self.device, width=66, **combo)
-        self.device_combo.grid(row=0, column=1, sticky="ew")
-        self.start_button = ui_button(controls, "●  开始", self.toggle, primary=True, width=76)
-        self.start_button.grid(row=0, column=2, padx=(7, 0))
+    def _build_feed(self):
+        self.body = ctk.CTkFrame(self.main, fg_color="transparent")
+        self.body.grid(row=1, column=0, sticky="nsew", padx=16, pady=(5, 4))
+        self.empty = ctk.CTkFrame(self.body, fg_color="transparent")
+        ctk.CTkLabel(self.empty, text="", image=self.wave, height=32).pack()
+        self.empty_title = label(self.empty, "", 23, bold=True)
+        self.empty_title.pack(pady=(8, 4))
+        self.empty_hint = label(self.empty, "", color=MUTED)
+        self.empty_hint.pack()
+        self.transcript = tk.Text(self.body, bg=PAPER, fg=INK, relief="flat", borderwidth=0,
+                                  highlightthickness=0, wrap="word", padx=12, pady=8, cursor="arrow",
+                                  selectbackground=SELECT, state="disabled", width=1, height=1)
+        self.scroll = ctk.CTkScrollbar(self.body, width=9, button_color=BORDER, button_hover_color="#BCCAE4",
+                                       command=self.transcript.yview)
+        self.transcript.configure(yscrollcommand=self.scroll.set)
+        self._size_fonts()
+        self.body.bind("<Configure>", lambda _: self._size_fonts())
 
-        source_card = ctk.CTkFrame(self.compact, fg_color=PALE, corner_radius=14)
-        source_card.pack(fill="x", padx=20, pady=(0, 9))
-        ctk.CTkLabel(source_card, text="原文  ORIGINAL", text_color="#768DB8", font=ctk.CTkFont(family=FONT, size=11, weight="bold"), anchor="w").pack(fill="x", padx=16, pady=(10, 0))
-        self.source = ctk.CTkLabel(source_card, text="说话后，原文会显示在这里", text_color="#5C7097", font=ctk.CTkFont(family=FONT, size=13), anchor="w", justify="left")
-        self.source.pack(fill="x", padx=16, pady=(1, 12))
-        target_card = ctk.CTkFrame(self.compact, fg_color=ICE, corner_radius=14)
-        target_card.pack(fill="both", expand=True, padx=20, pady=(0, 8))
-        ctk.CTkLabel(target_card, text="译文  TRANSLATION", text_color="#6F83B0", font=ctk.CTkFont(family=FONT, size=11, weight="bold"), anchor="w").pack(fill="x", padx=16, pady=(11, 0))
-        self.target = ctk.CTkLabel(target_card, text="翻译结果会显示在这里", text_color=INK, font=ctk.CTkFont(family=FONT, size=20, weight="bold"), anchor="w", justify="left")
-        self.target.pack(fill="both", expand=True, padx=16, pady=(2, 12))
-        footer = ctk.CTkFrame(self.compact, fg_color="transparent")
-        footer.pack(fill="x", padx=22, pady=(0, 12))
-        ctk.CTkLabel(footer, textvariable=self.status, text_color=MUTED, font=ctk.CTkFont(family=FONT, size=11)).pack(side="left")
-        ctk.CTkSlider(footer, from_=0.55, to=1.0, width=105, height=14, fg_color="#D9E4F8", progress_color="#A7B9E0", button_color="#8DA3D3", button_hover_color="#7D95C9", command=self.set_opacity).pack(side="right")
-        ctk.CTkLabel(footer, text="透明度", text_color=MUTED, font=ctk.CTkFont(family=FONT, size=11)).pack(side="right", padx=(0, 8))
+    def _size_fonts(self):
+        box = self.transcript
+        factor = min(1.1, max(.85, self.body.winfo_width() / self.body._get_widget_scaling() / 620))
+        for tag, size, color, before, after, weight in (
+            ("stamp", 9, MUTED, 10, 3, "normal"), ("original", 12, SUB, 0, 4, "normal"),
+            ("translation", 16, INK, 0, 12, "bold")):
+            box.tag_configure(tag, font=(FONT, max(8, round(size * factor * self.zoom)), weight),
+                              foreground=color, spacing1=before, spacing3=after)
 
-    def set_opacity(self, value):
-        self.opacity = float(value)
-        if self.active_view == "subtitles":
-            self.attributes("-alpha", self.opacity)
+    def _zoom(self, event):
+        self.zoom = min(1.8, max(.7, self.zoom + (.1 if event.delta > 0 else -.1)))
+        self._size_fonts()
+        return "break"
 
-    def on_zoom(self, event):
-        if self.active_view == "subtitles":
-            self.zoom = min(1.8, max(.7, self.zoom + (.1 if event.delta > 0 else -.1)))
-            self.on_resize()
+    def _build_dock(self):
+        dock = ctk.CTkFrame(self.main, fg_color="transparent")
+        dock.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 13))
+        dock.grid_columnconfigure(0, weight=1)
+        self.notice = label(dock, "", 11, ACCENT, anchor="w", textvariable=self.status)
+        self.notice.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 3))
+        strip = ctk.CTkFrame(dock, fg_color="transparent")
+        strip.grid(row=1, column=0, sticky="ew", padx=(4, 6))
+        badge = ctk.CTkFrame(strip, fg_color="#EAF0FC", corner_radius=12)
+        badge.pack(side="left", padx=(0, 8))
+        label(badge, "中  ⇄  EN", 12, ACCENT, bold=True).pack(padx=10, pady=6)
+        self.action = label(strip, "", 12, SUB, anchor="w")
+        self.action.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.live_link = button(strip, "回到录制", lambda: self.select_session(self.session_id), 68, fill=SELECT)
+        self.orb = ctk.CTkButton(dock, text="", image=self.orbs[0], width=66, height=66, corner_radius=6,
+                                 border_spacing=0, fg_color="transparent", hover_color="#E7ECF9", command=self.toggle)
+        self.orb.grid(row=1, column=1)
+        tk.Frame.configure(self.orb, takefocus=True)
+        tk.Misc.bind(self.orb, "<Return>", lambda _: self.toggle())
+        tk.Misc.bind(self.orb, "<space>", lambda _: self.toggle())
+        tk.Misc.bind(self.orb, "<FocusIn>", lambda _: self.orb.configure(fg_color=SELECT))
+        tk.Misc.bind(self.orb, "<FocusOut>", lambda _: self.orb.configure(fg_color="transparent"))
 
-    def on_resize(self, event=None):
-        if self.active_view != "subtitles" or not hasattr(self, "source"):
-            return
-        width = self.content.winfo_width()
-        scale = self.compact._get_widget_scaling()
-        factor = min(width / (760 * scale), self.winfo_height() / (355 * scale)) * self.zoom
-        wrap = max(100, round(width / scale) - 74)
-        self.source.configure(font=ctk.CTkFont(family=FONT, size=max(11, min(23, round(13 * factor)))), wraplength=wrap)
-        self.target.configure(font=ctk.CTkFont(family=FONT, size=max(16, min(36, round(20 * factor))), weight="bold"), wraplength=wrap)
-
-    def open_view(self, name):
-        self.compact_geometry = self.geometry()
-        self.workspace.pack_forget()
-        self.active_view = name
-        self.attributes("-topmost", False)
-        self.attributes("-alpha", 1.0)
-        self.minsize(760, 520)
-        self.geometry("1060x700+180+70")
-        self.page = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
-        self.page.pack(fill="both", expand=True)
-        return self.page
-
-    def back(self):
-        self.page.destroy()
-        self.minsize(560, 290)
-        self.geometry(self.compact_geometry)
-        self.workspace.pack(fill="both", expand=True)
-        self.show_subtitles()
-        self.attributes("-topmost", True)
-
-    def show_subtitles(self):
-        self.history_panel.pack_forget()
-        self.active_view = "subtitles"
-        self.compact.pack(fill="both", expand=True)
-        if self.sidebar_open:
-            self.highlight_selected()
-        self.attributes("-alpha", self.opacity)
-        self.after_idle(self.on_resize)
-
-    def toggle_sidebar(self):
-        self.sidebar_open = not self.sidebar_open
-        if self.sidebar_open:
-            self.refresh_sessions()
-            self.sidebar.grid(row=0, column=0, sticky="ns")
+    def _dock_state(self):
+        stopping = self.recording and self.stop_event.is_set()
+        text = "正在保存…" if stopping else "点击头像暂停" if self.recording else "点击头像继续" if self.view_id else "点击头像录制"
+        self.action.configure(text=text)
+        self.orb.configure(image=self.orbs[int(self.recording)], state="disabled" if stopping else "normal")
+        if self.recording and self.view_id != self.session_id:
+            self.action.pack_forget()
+            self.live_link.pack(side="left")
         else:
-            self.sidebar.grid_remove()
-        text = "收起" if self.sidebar_open else "☰ 历史"
-        self.history_toggle.configure(text=text)
-        self.detail_toggle.configure(text=text)
-        self.after_idle(self.on_resize)
+            self.live_link.pack_forget()
+            if not self.action.winfo_manager():
+                self.action.pack(side="left", fill="x", expand=True)
 
-    def _build_sidebar(self):
-        sidebar = self.sidebar = ctk.CTkFrame(self.workspace, fg_color="#EDF3FC", corner_radius=0, width=180)
-        sidebar.pack_propagate(False)
-        top = ctk.CTkFrame(sidebar, fg_color="transparent")
-        top.pack(fill="x", padx=10, pady=(12, 3))
-        ctk.CTkLabel(top, text="历史对话", text_color=INK, font=ctk.CTkFont(family=FONT, size=14, weight="bold")).pack(side="left", padx=5)
-        ui_button(top, "‹ 收起", self.toggle_sidebar, width=58).pack(side="right")
-        ui_button(sidebar, "＋ 新会话", self.new_session_from_history).pack(padx=10, pady=(0, 7), fill="x")
-        self.session_scroll = ctk.CTkScrollableFrame(sidebar, fg_color="transparent", scrollbar_button_color="#C8D7F0", scrollbar_button_hover_color="#AABEE4")
-        self.session_scroll.pack(fill="both", expand=True, padx=(5, 2), pady=(0, 9))
+    def toggle_history(self):
+        self.set_panel(None if self.panel == "history" else "history")
 
-    def refresh_sessions(self):
-        for child in self.session_scroll.winfo_children():
+    def toggle_settings(self):
+        if self.panel == "settings":
+            self.set_panel(self.before_settings)
+        else:
+            self.before_settings = self.panel
+            self.set_panel("settings")
+
+    def set_panel(self, name):
+        self.panel = name
+        for child in self.side.winfo_children():
             child.destroy()
-        self.session_buttons = {}
-        sessions = self.history_store.sessions()
-        if not sessions:
-            ctk.CTkLabel(self.session_scroll, text="暂无会话", text_color=MUTED).pack(anchor="w", padx=8)
-        for sid, started, ended, provider in sessions:
-            text = f"{datetime.fromtimestamp(started):%m月%d日  %H:%M}\n{provider}"
-            button = ctk.CTkButton(self.session_scroll, text=text, height=62, corner_radius=10, anchor="w", fg_color="transparent", hover_color=HOVER, text_color="#52678F", font=ctk.CTkFont(family=FONT, size=12, weight="normal"), command=lambda session_id=sid: self.select_session(session_id))
-            button.pack(fill="x", padx=4, pady=2)
-            self.session_buttons[sid] = button
-        self.highlight_selected()
+        self.history_toggle.configure(fg_color=SELECT if name == "history" else "#EEF2FA")
+        self.settings_btn.configure(fg_color=SELECT if name == "settings" else "transparent")
+        if name is None:
+            self.side.grid_remove()
+            return
+        self.side.grid(row=0, column=0, sticky="ns")
+        row = ctk.CTkFrame(self.side, fg_color="transparent")
+        row.pack(fill="x", padx=(17, 9), pady=(12, 6))
+        label(row, {"history": "历史对话", "settings": "录制设置", "export": "导出对话"}[name], 15, bold=True).pack(side="left")
+        button(row, "\ue76b", self.toggle_settings if name == "settings" else lambda: self.set_panel(None), symbol=True).pack(side="right")
+        if name == "settings":
+            self._settings()
+        elif name == "export":
+            label(self.side, "保存位置", 12, SUB).pack(anchor="w", padx=16, pady=(18, 6))
+            entry = ctk.CTkEntry(self.side, textvariable=self.export_folder, border_color=BORDER,
+                                 border_width=1, fg_color="white", text_color=INK)
+            entry.pack(fill="x", padx=12)
+            label(self.side, "原文、译文分别保存为 TXT，\n包含会话和每段字幕的时间。", 11, MUTED,
+                  justify="left").pack(anchor="w", padx=16, pady=12)
+            button(self.side, "保存两个文件", self.export, fill=SELECT).pack(fill="x", padx=12)
+        else:
+            button(self.side, "＋   新会话", self.new_session, fill="#E1E9F9", anchor="w").pack(fill="x", padx=12, pady=(6, 9))
+            self.listing = ctk.CTkScrollableFrame(self.side, fg_color="transparent", scrollbar_button_color=BORDER)
+            self.listing.pack(fill="both", expand=True, padx=(8, 2), pady=(0, 8))
+            self._history_list()
 
-    def _build_history(self):
-        content = self.history_panel = ctk.CTkFrame(self.content, fg_color=BG, corner_radius=0)
-        toolbar = ctk.CTkFrame(content, fg_color="transparent")
-        toolbar.pack(fill="x", padx=12, pady=(10, 2))
-        self.detail_toggle = ui_button(toolbar, "☰ 历史", self.toggle_sidebar, width=66)
-        self.detail_toggle.pack(side="left")
-        ui_button(toolbar, "返回字幕", self.show_subtitles, width=78).pack(side="right")
-        self.history_heading = ctk.CTkLabel(content, text="选择一段对话", text_color=INK, font=ctk.CTkFont(family=FONT, size=23, weight="bold"), anchor="w")
-        self.history_heading.pack(fill="x", padx=18)
-        self.history_meta = ctk.CTkLabel(content, text="整场原文和译文会在这里按时间排列", text_color=MUTED, font=ctk.CTkFont(family=FONT, size=11), anchor="w")
-        self.history_meta.pack(fill="x", padx=18, pady=(2, 6))
-        actions = ctk.CTkFrame(content, fg_color="transparent")
-        actions.pack(side="bottom", fill="x", padx=12, pady=(5, 9))
-        ui_button(actions, "继续这段对话", self.continue_selected, width=125).pack(side="left")
-        ui_button(actions, "导出原文和译文", self.export_selected, width=140).pack(side="right")
-        self.messages = ctk.CTkScrollableFrame(content, height=60, fg_color="#FFFFFF", corner_radius=14, scrollbar_button_color="#C8D7F0", scrollbar_button_hover_color="#AABEE4")
-        self.messages.pack(fill="both", expand=True, padx=12)
-
-    def highlight_selected(self):
-        for session_id, button in self.session_buttons.items():
-            selected = self.active_view == "history" and session_id == self.selected_session_id
-            button.configure(fg_color="#DDE8FC" if selected else "transparent", text_color=INK if selected else "#52678F")
-
-    def select_session(self, sid):
-        self.selected_session_id = sid
-        self.active_view = "history"
-        self.compact.pack_forget()
-        self.history_panel.pack(fill="both", expand=True)
-        self.attributes("-alpha", 1.0)
-        self.highlight_selected()
-        session = next(row for row in self.history_store.sessions() if row[0] == sid)
-        self.history_heading.configure(text=f"会话 · {datetime.fromtimestamp(session[1]):%m月%d日 %H:%M}")
-        self.history_meta.configure(text=f"开始 {clock_text(session[1])}\n结束 {clock_text(session[2]) if session[2] else '进行中'}")
-        for child in self.messages.winfo_children():
+    def _history_list(self):
+        if self.panel != "history":
+            return
+        for child in self.listing.winfo_children():
             child.destroy()
-        segments = self.history_store.segments(sid)
-        if not segments:
-            ctk.CTkLabel(self.messages, text="这段会话还没有字幕记录", text_color=MUTED).pack(pady=16)
-        for started, ended, original, translated in segments:
-            ctk.CTkLabel(self.messages, text=f"{clock_text(started)}  →  {clock_text(ended)}", text_color="#A0ADC8", font=ctk.CTkFont(family=FONT, size=10)).pack(pady=(16, 7))
-            for color, title, text, pad in ((PALE, "原文", original, (8, 35)), (ICE, "译文", translated, (35, 8))):
-                card = ctk.CTkFrame(self.messages, fg_color=color, corner_radius=13)
-                card.pack(fill="x", padx=pad, pady=(0, 6))
-                ctk.CTkLabel(card, text=title, text_color="#7287B0", font=ctk.CTkFont(family=FONT, size=10, weight="bold"), anchor="w").pack(fill="x", padx=16, pady=(11, 0))
-                label = ctk.CTkLabel(card, text=text, text_color=INK, font=ctk.CTkFont(family=FONT, size=13), anchor="w", justify="left")
-                label.pack(fill="x", padx=12, pady=(3, 13))
-                card.bind("<Configure>", lambda event, message=label: message.configure(
-                    wraplength=max(80, round(event.width / message._get_widget_scaling()) - 24)))
+        group = None
+        rows = self.history_store.session_previews()
+        if not rows:
+            label(self.listing, "录制后，会话会出现在这里", 11, MUTED).pack(anchor="w", padx=6, pady=6)
+        for sid, started, preview in rows:
+            date = datetime.fromtimestamp(started)
+            day = "今天" if date.date() == datetime.now().date() else date.strftime("%Y/%m/%d")
+            if day != group:
+                label(self.listing, day, 11, MUTED).pack(anchor="w", padx=8, pady=(12, 4))
+                group = day
+            title = " ".join((preview or "同传会话").split())
+            text = f"{date:%H:%M}   {title[:12]}" + ("…" if len(title) > 12 else "")
+            button(self.listing, text, lambda s=sid: self.select_session(s), fill=SELECT if sid == self.view_id else "transparent",
+                   anchor="w").pack(fill="x", pady=1)
 
-    def new_session_from_history(self):
-        if self.worker and self.worker.is_alive():
-            messagebox.showinfo("请先暂停", "先暂停录音，再新建会话。", parent=self)
-            return
-        self.session_id = None
-        self.session_label.configure(text="新会话")
-        self.source.configure(text="说话后，原文会显示在这里")
-        self.target.configure(text="翻译结果会显示在这里")
-        self.status.set("下一次开始将创建新会话")
-        self.show_subtitles()
-
-    def continue_selected(self):
-        sid = self.selected_session_id
-        if sid is None:
-            return
-        if self.worker and self.worker.is_alive():
-            messagebox.showinfo("请先暂停", "先暂停录音，再继续历史会话。", parent=self)
-            return
-        self.session_id = sid
-        rows = self.history_store.segments(sid)
-        self.session_label.configure(text=f"会话 #{sid}")
-        if rows:
-            self.source.configure(text=rows[-1][2])
-            self.target.configure(text=rows[-1][3])
-        self.status.set(f"已选择会话 #{sid}，点击开始后继续记录")
-        self.show_subtitles()
-
-    def export_selected(self):
-        sid = self.selected_session_id
-        if sid is None:
-            return
-        folder = filedialog.askdirectory(parent=self, title="选择导出文件夹")
-        if not folder:
-            return
-        rows = self.history_store.segments(sid)
-        session = next(row for row in self.history_store.sessions() if row[0] == sid)
-        stem = f"会话_{datetime.fromtimestamp(session[1]):%Y%m%d_%H%M%S}_{sid}"
-        for suffix, index in (("原文", 2), ("译文", 3)):
-            lines = [f"开始：{clock_text(session[1])}", f"结束：{clock_text(session[2]) if session[2] else '进行中'}", ""]
-            lines += [f"[{clock_text(row[0])} – {clock_text(row[1])}] {row[index]}" for row in rows]
-            (Path(folder) / f"{stem}_{suffix}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-        messagebox.showinfo("导出完成", "已分别保存原文和译文两个 TXT 文件。", parent=self)
-
-    def show_settings(self):
-        page = self.open_view("settings")
-        ui_button(page, "←  返回字幕", self.back, width=110).pack(anchor="w", padx=30, pady=(22, 18))
-        ctk.CTkLabel(page, text="服务设置", text_color=INK, font=ctk.CTkFont(family=FONT, size=23, weight="bold"), anchor="w").pack(fill="x", padx=45)
-        ctk.CTkLabel(page, text="密钥只保存在当前 Windows 用户的凭据管理器中。", text_color=MUTED, font=ctk.CTkFont(family=FONT, size=11), anchor="w").pack(fill="x", padx=45, pady=(3, 18))
-        form = ctk.CTkFrame(page, fg_color="#FFFFFF", corner_radius=14)
-        form.pack(fill="x", padx=45)
-        self.key_entries = {}
-        for label, account in (("DeepSeek API Key", "deepseek_key"), ("腾讯云 AppID", "tencent_appid"), ("腾讯云 SecretId", "tencent_id"), ("腾讯云 SecretKey", "tencent_key")):
-            ctk.CTkLabel(form, text=label, text_color="#647AA7", font=ctk.CTkFont(family=FONT, size=11), anchor="w").pack(fill="x", padx=22, pady=(14, 3))
-            entry = ctk.CTkEntry(form, height=38, corner_radius=9, fg_color=BG, border_color="#D9E4F7", text_color=INK, show="*" if "key" in account or account == "tencent_id" else "")
-            entry.pack(fill="x", padx=22, pady=(0, 4))
+    def _settings(self):
+        save = button(self.side, "保存设置", self.save_settings, fill=SELECT)
+        save.pack(side="bottom", fill="x", padx=14, pady=10)
+        form = ctk.CTkScrollableFrame(self.side, fg_color="transparent", scrollbar_button_color=BORDER)
+        form.pack(fill="both", expand=True, padx=(8, 2))
+        def caption(text):
+            label(form, text, 11, SUB).pack(anchor="w", padx=4, pady=(12, 4))
+        self.options = []
+        for name, var, values in (("翻译服务", self.mode, ["DeepSeek 近实时", "腾讯云 实时"]),
+                                   ("麦克风", self.device, list(self.devices) or ["无可用麦克风"])):
+            caption(name)
+            menu = ctk.CTkOptionMenu(form, variable=var, values=values, width=110, dynamic_resizing=False,
+                                     fg_color="white", button_color="#DCE5F6", button_hover_color=SELECT,
+                                     text_color=INK, dropdown_fg_color=PAPER, dropdown_text_color=INK,
+                                     state="disabled" if self.recording else "normal", font=font(11))
+            menu.pack(fill="x", padx=2)
+            self.options.append(menu)
+        caption("窗口透明度")
+        slider = ctk.CTkSlider(form, from_=.55, to=1., width=100, button_color=ACCENT, progress_color="#A6B9DF",
+                               button_hover_color=SUB, command=self.set_opacity)
+        slider.set(self.opacity)
+        slider.pack(fill="x", padx=6, pady=(4, 8))
+        self.entries = {}
+        for name, account in (("DeepSeek API Key", "deepseek_key"), ("腾讯云 AppID", "tencent_appid"),
+                              ("腾讯云 SecretId", "tencent_id"), ("腾讯云 SecretKey", "tencent_key")):
+            caption(name)
+            entry = ctk.CTkEntry(form, show="*", border_width=1, border_color=BORDER, fg_color="white", text_color=INK)
+            entry.pack(fill="x", padx=2, pady=(0, 3))
             try:
                 entry.insert(0, keyring.get_password(SERVICE, account) or "")
             except Exception:
-                entry.configure(placeholder_text="无法读取已保存的密钥")
-            self.key_entries[account] = entry
-        ctk.CTkFrame(form, height=10, fg_color="transparent").pack()
-        ui_button(page, "保存设置", self.save_settings, primary=True, width=110).pack(anchor="e", padx=45, pady=20)
+                entry.configure(state="disabled")
+            self.entries[account] = entry
+
+    def set_opacity(self, value):
+        self.opacity = float(value)
+        self.attributes("-alpha", self.opacity)
 
     def save_settings(self):
         try:
-            for account, entry in self.key_entries.items():
+            for account, entry in self.entries.items():
+                if entry.cget("state") == "disabled":
+                    continue
                 value = entry.get().strip()
                 if value:
                     keyring.set_password(SERVICE, account, value)
                 else:
-                    try: keyring.delete_password(SERVICE, account)
-                    except keyring.errors.PasswordDeleteError: pass
+                    try:
+                        keyring.delete_password(SERVICE, account)
+                    except keyring.errors.PasswordDeleteError:
+                        pass
         except Exception as exc:
-            messagebox.showerror("保存失败", str(exc), parent=self)
+            self.status.set(f"无法保存凭据 · {type(exc).__name__}")
             return
-        self.back()
+        self.set_panel(self.before_settings)
+        self.status.set("设置已保存")
+
+    def _select(self, sid):
+        self.view_id = sid
+        self._header_state()
+        self.transcript.configure(state="normal")
+        self.transcript.delete("1.0", "end")
+        self.transcript.mark_set("draft", "1.0")
+        self.transcript.mark_gravity("draft", "left")
+        self.transcript.configure(state="disabled")
+        segments = self.history_store.segments(sid) if sid else []
+        self.has_text = False
+        for row in segments:
+            self._write_segment(*row, final=True, scroll=False)
+        if self.recording and sid == self.session_id and any(self.partial):
+            self._write_segment(time.time(), None, *self.partial, final=False)
+        if not self.has_text:
+            self.scroll.pack_forget()
+            self.transcript.pack_forget()
+            self.empty_title.configure(text="正在聆听" if self.recording and sid == self.session_id else "开始一段同传" if sid is None else "暂无字幕")
+            self.empty_hint.configure(text="识别到的原文和译文会逐段显示" if self.recording and sid == self.session_id else
+                                      "原文与译文将在这里逐段显示" if sid is None else "这段会话还没有已保存的内容")
+            self.empty.place(relx=.5, rely=.48, anchor="center")
+        self.transcript.yview_moveto(1. if sid == self.session_id else 0.)
+        self._history_list()
+        self._dock_state()
+
+    def _header_state(self):
+        info = self.history_store.session(self.view_id) if self.view_id else None
+        self.heading.configure(text="中英同传" if not info else f"{datetime.fromtimestamp(info[1]):%m月%d日}同传")
+        if info:
+            start = datetime.fromtimestamp(info[1])
+            end = datetime.fromtimestamp(info[2]) if info[2] else None
+            finish = (end.strftime("%H:%M:%S") if end.date() == start.date() else clock_text(info[2])) if end else "进行中"
+            self.meta.configure(text=f"{start:%Y/%m/%d  %H:%M:%S}  –  {finish}")
+        else:
+            self.meta.configure(text="新会话")
+        self.export_btn.configure(state="normal" if info else "disabled")
+
+    def _write_segment(self, started, ended, original, translated, *, final, scroll=True):
+        box = self.transcript
+        at_bottom = box.yview()[1] >= .975
+        if not self.has_text:
+            self.empty.place_forget()
+            self.scroll.pack(side="right", fill="y")
+            box.pack(fill="both", expand=True)
+            self.has_text = True
+        box.configure(state="normal")
+        box.delete("draft", "end-1c")
+        stamp = datetime.fromtimestamp(started).strftime("%H:%M:%S")
+        if ended:
+            stamp += datetime.fromtimestamp(ended).strftime("  –  %H:%M:%S")
+        box.insert("end-1c", stamp + "\n", "stamp")
+        box.insert("end-1c", original + "\n", "original")
+        box.insert("end-1c", (translated or "翻译中…") + "\n", "translation")
+        if final:
+            box.mark_set("draft", "end-1c")
+        box.configure(state="disabled")
+        if scroll and at_bottom:
+            box.see("end")
+
+    def select_session(self, sid):
+        self.status.set("")
+        self._select(sid)
+
+    def new_session(self):
+        if self.recording:
+            self.status.set("请先点击头像暂停当前录制")
+            return
+        self.session_id = None
+        if self.panel == "export":
+            self.set_panel(None)
+        self.select_session(None)
+
+    def export(self):
+        sid = self.view_id
+        if not sid:
+            return
+        folder = Path(self.export_folder.get().strip()).expanduser()
+        if not folder.is_absolute():
+            self.status.set("请输入完整的保存文件夹路径")
+            return
+        _, start, end, _ = self.history_store.session(sid)
+        stem = f"会话_{datetime.fromtimestamp(start):%Y%m%d_%H%M%S}_{sid}"
+        rows = self.history_store.segments(sid)
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            for suffix, index in (("原文", 2), ("译文", 3)):
+                lines = [f"开始：{clock_text(start)}", f"结束：{clock_text(end) if end else '进行中'}", ""]
+                lines += [f"[{clock_text(r[0])} – {clock_text(r[1])}] {r[index]}" for r in rows]
+                (folder / f"{stem}_{suffix}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError as exc:
+            self.status.set(f"导出失败 · {exc.strerror}")
+            return
+        self.status.set("已分别导出原文和译文")
 
     def toggle(self):
-        if self.worker and self.worker.is_alive():
+        if self.closing:
+            return
+        if self.recording:
             self.stop_event.set()
-            if self.stream: self.stream.stop(); self.stream.close(); self.stream = None
-            if self.session_id is not None: self.history_store.end(self.session_id)
-            self.start_button.configure(text="●  开始")
-            self.mode_combo.configure(state="normal")
-            self.device_combo.configure(state="normal")
-            self.status.set("正在停止")
+            self._close_stream()
+            self._dock_state()
+            self.status.set("正在保存最后一段…")
             return
-        credentials = ["deepseek_key"] if self.mode.get().startswith("DeepSeek") else ["tencent_appid", "tencent_id", "tencent_key"]
+        deepseek = self.mode.get().startswith("DeepSeek")
+        credentials = ["deepseek_key"] if deepseek else ["tencent_appid", "tencent_id", "tencent_key"]
         try:
-            missing = any(not keyring.get_password(SERVICE, key) for key in credentials)
-        except Exception as exc:
-            messagebox.showerror("凭据读取失败", str(exc), parent=self)
+            missing = any(not keyring.get_password(SERVICE, name) for name in credentials)
+        except Exception:
+            self.status.set("无法读取 Windows 凭据，请检查设置")
             return
-        if missing:
-            messagebox.showinfo("需要密钥", "请先在“设置”中填写当前服务的凭据。", parent=self)
+        if missing or self.device.get() not in self.devices:
+            self.status.set("请在左侧填写当前翻译服务的密钥" if missing else "请在左侧选择可用的麦克风")
+            if self.panel != "settings":
+                self.toggle_settings()
             return
-        if self.device.get() not in self.devices:
-            messagebox.showerror("麦克风", "没有可用的麦克风。", parent=self)
-            return
-        self.stop_event.clear()
         self.audio = queue.Queue(maxsize=100)
+        self.stop_event.clear()
         try:
-            self.stream = sd.RawInputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16", blocksize=FRAME_SAMPLES, device=self.devices[self.device.get()], callback=self.capture)
+            self.stream = sd.RawInputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
+                                           blocksize=FRAME_SAMPLES, device=self.devices[self.device.get()], callback=self.capture)
             self.stream.start()
+            if self.view_id is None:
+                sid = self.history_store.begin(self.mode.get())
+            else:
+                sid = self.view_id
+                self.history_store.resume(sid)
         except Exception as exc:
-            self.stream = None
-            messagebox.showerror("麦克风启动失败", str(exc), parent=self)
+            self._close_stream()
+            self.status.set(f"无法开始录制 · {exc}")
             return
-        self.worker = threading.Thread(target=self.deepseek_loop if self.mode.get().startswith("DeepSeek") else self.tencent_loop, daemon=True)
+        self.session_id = sid
+        self.recording = True
+        self.partial = ("", "")
         self.capture_started = time.time()
-        if self.session_id is None:
-            self.session_id = self.history_store.begin(self.mode.get())
-            self.session_label.configure(text=f"会话 #{self.session_id}")
-            if self.sidebar_open:
-                self.refresh_sessions()
-        else:
-            self.history_store.resume(self.session_id)
-        self.worker.start()
-        self.start_button.configure(text="Ⅱ  暂停")
-        self.mode_combo.configure(state="disabled")
-        self.device_combo.configure(state="disabled")
         self.status.set("正在收音")
+        self._select(sid)
+        if self.panel == "settings":
+            for menu in self.options:
+                menu.configure(state="disabled")
+        backend = AudioBackend.deepseek_loop if deepseek else AudioBackend.tencent_loop
+        self.worker = threading.Thread(target=self._run, args=(backend,), daemon=True)
+        self.worker.start()
+
+    def _run(self, backend):
+        try:
+            backend(self)
+        except Exception as exc:
+            self.events.put(("status", f"录制中断 · {type(exc).__name__}"))
+        finally:
+            self.events.put(("finished",))
+
+    def _close_stream(self):
+        if self.stream is not None:
+            stream, self.stream = self.stream, None
+            try:
+                stream.stop()
+            finally:
+                stream.close()
 
     def poll(self):
-        try:
-            while True:
-                event = self.events.get_nowait()
-                if event[0] in ("pair", "final_pair"):
-                    self.source.configure(text=event[3]); self.target.configure(text=event[4])
-                    if event[0] == "final_pair" and event[5] is not None and (event[3] or event[4]):
-                        self.history_store.append(event[5], event[1], event[2], event[3], event[4])
-                        if self.active_view == "history" and self.selected_session_id == event[5]:
-                            self.select_session(event[5])
-                elif event[0] == "source":
-                    self.source.configure(text=event[1]); self.target.configure(text="翻译中…")
-                elif event[0] == "status": self.status.set(event[1])
-                elif event[0] == "stopped":
-                    if self.stream: self.stream.stop(); self.stream.close(); self.stream = None
-                    if self.session_id is not None: self.history_store.end(self.session_id)
-                    self.start_button.configure(text="●  开始")
-                    self.mode_combo.configure(state="normal")
-                    self.device_combo.configure(state="normal")
-        except queue.Empty: pass
-        if self.closing and (not self.worker or not self.worker.is_alive()) and self.events.empty():
-            if self.session_id is not None: self.history_store.end(self.session_id)
+        while not self.events.empty():
+            e = self.events.get_nowait()
+            if e[0] in ("source", "pair", "final_pair"):
+                if e[0] == "source":
+                    start, end, src, dst, sid = time.time(), None, e[1], "", self.session_id
+                else:
+                    _, start, end, src, dst, sid = e
+                final = e[0] == "final_pair"
+                if sid is None or not (src or dst):
+                    continue
+                self.partial = ("", "") if final else (src, dst)
+                if final:
+                    self.history_store.append(sid, start, end, src, dst)
+                if self.view_id == sid:
+                    self._write_segment(start, end, src, dst, final=final)
+                if final and self.panel == "history" and sid not in self.titled_sessions:
+                    self.titled_sessions.add(sid)
+                    self._history_list()
+            elif e[0] == "status":
+                self.status.set(e[1])
+            elif e[0] == "finished":
+                self._close_stream()
+                self.history_store.end(self.session_id)
+                self.recording = False
+                had_partial = any(self.partial)
+                self.partial = ("", "")
+                if self.view_id == self.session_id and (had_partial or not self.has_text):
+                    self._select(self.view_id)
+                else:
+                    self._header_state()
+                    self._dock_state()
+                if self.status.get() in ("正在收音", "正在保存最后一段…"):
+                    self.status.set("已暂停")
+                if self.panel == "settings":
+                    for menu in self.options:
+                        menu.configure(state="normal")
+        if self.closing and not self.recording:
             self.destroy()
         else:
             self.after(80, self.poll)
 
     def close(self):
-        if self.closing:
-            return
         self.closing = True
-        self.stop_event.set()
-        if self.stream: self.stream.stop(); self.stream.close(); self.stream = None
-        self.status.set("正在保存最后一段…")
-        if not self.worker or not self.worker.is_alive():
-            if self.session_id is not None: self.history_store.end(self.session_id)
+        if self.recording:
+            self.stop_event.set()
+            self._close_stream()
+            self._dock_state()
+            self.status.set("正在保存最后一段…")
+        else:
             self.destroy()
 
 
+def main():
+    if sys.platform != "win32":
+        InterpreterWindow().mainloop()
+        return
+
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel.CreateMutexW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.CreateMutexW(None, False, r"Local\ZhEnInterpreter.ConversationWindow")
+    already_open = ctypes.get_last_error() == 183
+    try:
+        if handle and already_open:
+            windows = ctypes.windll.user32
+            windows.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+            windows.FindWindowW.restype = wintypes.HWND
+            for _ in range(40):
+                hwnd = windows.FindWindowW("TkTopLevel", "中英同传字幕")
+                if hwnd:
+                    if windows.IsIconic(wintypes.HWND(hwnd)):
+                        windows.ShowWindow(wintypes.HWND(hwnd), 9)
+                    windows.SetForegroundWindow(wintypes.HWND(hwnd))
+                    break
+                time.sleep(.1)
+        else:
+            InterpreterWindow().mainloop()
+    finally:
+        if handle:
+            kernel.CloseHandle(handle)
+
+
 if __name__ == "__main__":
-    InterpreterWindow().mainloop()
+    main()

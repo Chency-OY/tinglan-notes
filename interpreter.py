@@ -90,6 +90,19 @@ class HistoryStore:
         with self.connect() as db:
             return db.execute("SELECT started,ended,source,target FROM segments WHERE session_id=? ORDER BY id", (session_id,)).fetchall()
 
+    def session(self, session_id: int):
+        with self.connect() as db:
+            return db.execute("SELECT id,started,ended,provider FROM sessions WHERE id=?", (session_id,)).fetchone()
+
+    def session_previews(self):
+        with self.connect() as db:
+            return db.execute("""
+                SELECT s.id, s.started, (
+                    SELECT substr(source, 1, 64) FROM segments
+                    WHERE session_id=s.id AND source <> '' ORDER BY id LIMIT 1
+                ) FROM sessions s ORDER BY s.started DESC, s.id DESC
+            """).fetchall()
+
 
 def wav_bytes(pcm: bytes) -> bytes:
     out = io.BytesIO()
