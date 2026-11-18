@@ -54,7 +54,12 @@ class HistoryStore:
                     source TEXT NOT NULL, target TEXT NOT NULL,
                     FOREIGN KEY(session_id) REFERENCES sessions(id)
                 );
+                CREATE TABLE IF NOT EXISTS preferences (
+                    name TEXT PRIMARY KEY, value TEXT NOT NULL
+                );
             """)
+            if "title" not in {row[1] for row in db.execute("PRAGMA table_info(sessions)")}:
+                db.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
 
     @contextmanager
     def connect(self):
@@ -65,9 +70,9 @@ class HistoryStore:
         finally:
             db.close()
 
-    def begin(self, provider: str) -> int:
+    def begin(self, provider: str, title=None) -> int:
         with self.connect() as db:
-            cursor = db.execute("INSERT INTO sessions(started,provider) VALUES (?,?)", (time.time(), provider))
+            cursor = db.execute("INSERT INTO sessions(started,provider,title) VALUES (?,?,?)", (time.time(), provider, title))
             return cursor.lastrowid
 
     def end(self, session_id: int):
@@ -97,11 +102,31 @@ class HistoryStore:
     def session_previews(self):
         with self.connect() as db:
             return db.execute("""
-                SELECT s.id, s.started, (
-                    SELECT substr(source, 1, 64) FROM segments
-                    WHERE session_id=s.id AND source <> '' ORDER BY id LIMIT 1
-                ) FROM sessions s ORDER BY s.started DESC, s.id DESC
+                SELECT id, started, title FROM sessions ORDER BY started DESC, id DESC
             """).fetchall()
+
+    def title(self, sid):
+        with self.connect() as db:
+            title, started = db.execute("SELECT title,started FROM sessions WHERE id=?", (sid,)).fetchone()
+            return title or datetime.fromtimestamp(started).strftime("%m.%d %H:%M")
+
+    def rename(self, sid, title):
+        with self.connect() as db:
+            db.execute("UPDATE sessions SET title=? WHERE id=?", (title or None, sid))
+
+    def delete_session(self, sid):
+        with self.connect() as db:
+            db.execute("DELETE FROM segments WHERE session_id=?", (sid,))
+            db.execute("DELETE FROM sessions WHERE id=?", (sid,))
+
+    def preference(self, name, default):
+        with self.connect() as db:
+            row = db.execute("SELECT value FROM preferences WHERE name=?", (name,)).fetchone()
+            return row[0] if row else default
+
+    def set_preference(self, name, value):
+        with self.connect() as db:
+            db.execute("INSERT OR REPLACE INTO preferences VALUES (?,?)", (name, value))
 
 
 def wav_bytes(pcm: bytes) -> bytes:

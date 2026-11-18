@@ -15,6 +15,7 @@ import sounddevice as sd
 from PIL import Image, ImageDraw, ImageOps
 
 from interpreter import FRAME_SAMPLES, SAMPLE_RATE, SERVICE, HistoryStore, Interpreter as AudioBackend, clock_text
+from routes import KEYS, priority_loop, priority_order
 
 PAPER = "#FAFBFE"
 SIDE = "#EEF2FB"
@@ -83,10 +84,15 @@ class InterpreterWindow(ctk.CTk):
         self.geometry("800x460")
         self.minsize(540, 300)
         self.opacity = .94
-        self.attributes("-topmost", True)
+        self.attributes("-topmost", False)
         self.attributes("-alpha", self.opacity)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.history_store = history_store or HistoryStore()
+        self.priority = priority_order(self.history_store.preference("priority", "DeepSeek|Kimi 订阅|腾讯云"))
+        self.float_enabled = ctk.BooleanVar(value=self.history_store.preference("overlay", "1") == "1")
+        self.overlay = None
+        self.float_text = ctk.StringVar(value="等待语音…")
+        self.draft_title = ""
         self.session_id = self.view_id = None
         self.recording = self.closing = False
         self.panel = None
@@ -102,7 +108,7 @@ class InterpreterWindow(ctk.CTk):
         self.titled_sessions = set()
         self.devices = {f"{i} · {d['name']}": i for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0}
         self.device = ctk.StringVar(value=next(iter(self.devices), "无可用麦克风"))
-        self.mode = ctk.StringVar(value="DeepSeek 近实时")
+        self.mode = ctk.StringVar(value=self.history_store.preference("mode", "按 API 优先级"))
         self.status = ctk.StringVar(value="")
         portrait = Image.open(ASSETS / "icon.png").convert("RGBA")
         self.orbs = [orb_image(portrait, active) for active in (False, True)]
@@ -133,6 +139,10 @@ class InterpreterWindow(ctk.CTk):
         title_box.pack(side="left", fill="x", expand=True)
         self.heading = label(title_box, "", 16, bold=True, anchor="w")
         self.heading.pack(fill="x")
+        self.heading.bind("<Double-Button-1>", lambda _: self.edit_title())
+        self.title_entry = ctk.CTkEntry(title_box, height=26, fg_color="white", border_color=BORDER, text_color=INK)
+        self.title_entry.bind("<Return>", lambda _: self.finish_title())
+        self.title_entry.bind("<Escape>", lambda _: self.cancel_title())
         self.meta = label(title_box, "", 10, MUTED, anchor="w")
         self.meta.pack(fill="x")
         self.settings_btn = button(bar, "设置", self.toggle_settings, 44)
@@ -188,6 +198,7 @@ class InterpreterWindow(ctk.CTk):
         self.action = label(strip, "", 12, SUB, anchor="w")
         self.action.pack(side="left", fill="x", expand=True, padx=(0, 5))
         self.live_link = button(strip, "回到录制", lambda: self.select_session(self.session_id), 68, fill=SELECT)
+        self.float_link = button(strip, "悬浮字幕", self.reopen_overlay, 72)
         self.orb = ctk.CTkButton(dock, text="", image=self.orbs[0], width=66, height=66, corner_radius=6,
                                  border_spacing=0, fg_color="transparent", hover_color="#E7ECF9", command=self.toggle)
         self.orb.grid(row=1, column=1)
@@ -202,6 +213,12 @@ class InterpreterWindow(ctk.CTk):
         text = "正在保存…" if stopping else "点击头像暂停" if self.recording else "点击头像继续" if self.view_id else "点击头像录制"
         self.action.configure(text=text)
         self.orb.configure(image=self.orbs[int(self.recording)], state="disabled" if stopping else "normal")
+        if self.recording:
+            self.float_link.pack(side="right")
+        else:
+            self.float_link.pack_forget()
+        if self.overlay is not None:
+            self.float_orb.configure(image=self.orbs[int(self.recording)], state="disabled" if stopping else "normal")
         if self.recording and self.view_id != self.session_id:
             self.action.pack_forget()
             self.live_link.pack(side="left")
@@ -212,6 +229,52 @@ class InterpreterWindow(ctk.CTk):
 
     def toggle_history(self):
         self.set_panel(None if self.panel == "history" else "history")
+
+    def close_overlay(self):
+        if self.overlay is not None:
+            self.overlay.destroy()
+            self.overlay = None
+
+    def reopen_overlay(self):
+        self.float_enabled.set(True)
+        self.update_overlay()
+
+    def update_overlay(self):
+        if not self.float_enabled.get() or not self.recording:
+            self.close_overlay()
+            return
+        if self.overlay is not None:
+            return
+        win = self.overlay = ctk.CTkToplevel(self, fg_color=PAPER)
+        win.title("录制字幕")
+        win.attributes("-toolwindow", True)
+        win.attributes("-topmost", True)
+        win.attributes("-alpha", self.opacity)
+        win.geometry("395x118")
+        win.minsize(300, 98)
+        win.protocol("WM_DELETE_WINDOW", self.close_overlay)
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+        label(win, "", 11, MUTED, textvariable=self.status, anchor="w").grid(row=0, column=0, sticky="ew", padx=12, pady=(6, 0))
+        self.float_caption = label(win, "", 15, INK, bold=True, textvariable=self.float_text, anchor="w", justify="left")
+        self.float_caption.grid(row=1, column=0, sticky="nsew", padx=12, pady=(3, 6))
+        self.float_caption.bind("<Configure>", lambda e: self.float_caption.configure(
+            wraplength=max(100, int(e.width / self.float_caption._get_widget_scaling()) - 8)))
+        self.float_orb = ctk.CTkButton(win, text="", width=66, height=66, image=self.orbs[1],
+                                       fg_color="transparent", hover_color=SELECT, command=self.toggle)
+        self.float_orb.grid(row=0, rowspan=2, column=1, padx=(0, 6))
+        if getattr(self, "overlay_position", None):
+            win.geometry(self.overlay_position)
+        else:
+            win.update_idletasks()
+            x = max(0, win.winfo_screenwidth() - win.winfo_width() - 45)
+            y = max(0, win.winfo_screenheight() - win.winfo_height() - 145)
+            win.geometry(f"+{x}+{y}")
+        win.bind("<Configure>", lambda e: self.remember_overlay(e, win))
+
+    def remember_overlay(self, event, win):
+        if event.widget == win and win.winfo_ismapped():
+            self.overlay_position = win.geometry()
 
     def toggle_settings(self):
         if self.panel == "settings":
@@ -259,16 +322,71 @@ class InterpreterWindow(ctk.CTk):
         rows = self.history_store.session_previews()
         if not rows:
             label(self.listing, "录制后，会话会出现在这里", 11, MUTED).pack(anchor="w", padx=6, pady=6)
-        for sid, started, preview in rows:
+        for sid, started, title in rows:
             date = datetime.fromtimestamp(started)
             day = "今天" if date.date() == datetime.now().date() else date.strftime("%Y/%m/%d")
             if day != group:
                 label(self.listing, day, 11, MUTED).pack(anchor="w", padx=8, pady=(12, 4))
                 group = day
-            title = " ".join((preview or "同传会话").split())
-            text = f"{date:%H:%M}   {title[:12]}" + ("…" if len(title) > 12 else "")
-            button(self.listing, text, lambda s=sid: self.select_session(s), fill=SELECT if sid == self.view_id else "transparent",
-                   anchor="w").pack(fill="x", pady=1)
+            card = ctk.CTkFrame(self.listing, fg_color=SELECT if sid == self.view_id else "transparent", corner_radius=10)
+            card.pack(fill="x", pady=2)
+            text = title or date.strftime("%m.%d %H:%M")
+            button(card, text, lambda s=sid: self.select_session(s), anchor="w").pack(fill="x")
+            actions = ctk.CTkFrame(card, fg_color="transparent")
+            actions.pack(fill="x", padx=4)
+            button(actions, "重命名", lambda s=sid: self.rename_from_history(s), 54).pack(side="left")
+            button(actions, "删除", lambda s=sid, a=actions: self.confirm_delete(s, a), 44).pack(side="left")
+
+    def rename_from_history(self, sid):
+        self.select_session(sid)
+        self.edit_title()
+
+    def edit_title(self):
+        self.title_entry.delete(0, "end")
+        self.title_entry.insert(0, self.history_store.title(self.view_id) if self.view_id else self.draft_title)
+        self.heading.pack_forget()
+        self.title_entry.pack(fill="x", before=self.meta)
+        self.title_entry.focus_set()
+        self.title_entry.select_range(0, "end")
+        self.status.set("输入名称，按回车保存；清空可恢复开始时间")
+
+    def cancel_title(self):
+        self.title_entry.pack_forget()
+        self.heading.pack(fill="x", before=self.meta)
+        return "break"
+
+    def finish_title(self):
+        value = self.title_entry.get().strip()
+        if self.view_id is None:
+            self.draft_title = value
+        else:
+            self.history_store.rename(self.view_id, value)
+        self.cancel_title()
+        self._header_state()
+        self._history_list()
+        self.status.set("名称已保存")
+
+    def confirm_delete(self, sid, actions):
+        if self.recording and self.session_id == sid:
+            self.status.set("请先暂停录制，再删除这段会话")
+            return
+        for child in actions.winfo_children():
+            child.destroy()
+        button(actions, "确认删除", lambda: self.delete_session(sid), 68, fill="#F3DFE6").pack(side="left")
+        button(actions, "取消", self._history_list, 42).pack(side="left")
+
+    def delete_session(self, sid):
+        if self.recording and self.session_id == sid:
+            return
+        self.history_store.delete_session(sid)
+        if self.session_id == sid:
+            self.session_id = None
+        if self.view_id == sid:
+            self.draft_title = ""
+            self._select(self.session_id)
+        else:
+            self._history_list()
+        self.status.set("会话已删除")
 
     def _settings(self):
         save = button(self.side, "保存设置", self.save_settings, fill=SELECT)
@@ -278,7 +396,7 @@ class InterpreterWindow(ctk.CTk):
         def caption(text):
             label(form, text, 11, SUB).pack(anchor="w", padx=4, pady=(12, 4))
         self.options = []
-        for name, var, values in (("翻译服务", self.mode, ["DeepSeek 近实时", "腾讯云 实时"]),
+        for name, var, values in (("录制模式", self.mode, ["按 API 优先级", "腾讯云 实时"]),
                                    ("麦克风", self.device, list(self.devices) or ["无可用麦克风"])):
             caption(name)
             menu = ctk.CTkOptionMenu(form, variable=var, values=values, width=110, dynamic_resizing=False,
@@ -287,13 +405,35 @@ class InterpreterWindow(ctk.CTk):
                                      state="disabled" if self.recording else "normal", font=font(11))
             menu.pack(fill="x", padx=2)
             self.options.append(menu)
+        caption("API 优先级 · 从上到下")
+        order_box = ctk.CTkFrame(form, fg_color="transparent")
+        order_box.pack(fill="x")
+        self.pending_priority = list(self.priority)
+        def draw_order():
+            for child in order_box.winfo_children():
+                child.destroy()
+            for index, name in enumerate(self.pending_priority):
+                row = ctk.CTkFrame(order_box, fg_color="transparent")
+                row.pack(fill="x")
+                label(row, f"{index + 1}  {name}", 11).pack(side="left", padx=3)
+                if index:
+                    button(row, "上移", lambda i=index: move(i), 40).pack(side="right")
+        def move(index):
+            order = self.pending_priority
+            order[index - 1], order[index] = order[index], order[index - 1]
+            draw_order()
+        draw_order()
+        label(form, "跳过未填密钥的服务。当前服务失败时，本段尝试下一项。", 11, MUTED,
+              wraplength=147, justify="left").pack(anchor="w", pady=5)
+        ctk.CTkCheckBox(form, text="录制时显示悬浮窗", variable=self.float_enabled, command=self.update_overlay,
+                        text_color=SUB, font=font(12)).pack(anchor="w", pady=(8, 2))
         caption("窗口透明度")
         slider = ctk.CTkSlider(form, from_=.55, to=1., width=100, button_color=ACCENT, progress_color="#A6B9DF",
                                button_hover_color=SUB, command=self.set_opacity)
         slider.set(self.opacity)
         slider.pack(fill="x", padx=6, pady=(4, 8))
         self.entries = {}
-        for name, account in (("DeepSeek API Key", "deepseek_key"), ("腾讯云 AppID", "tencent_appid"),
+        for name, account in (("Kimi Code 订阅 Key", "kimi_key"), ("DeepSeek API Key", "deepseek_key"), ("腾讯云 AppID", "tencent_appid"),
                               ("腾讯云 SecretId", "tencent_id"), ("腾讯云 SecretKey", "tencent_key")):
             caption(name)
             entry = ctk.CTkEntry(form, show="*", border_width=1, border_color=BORDER, fg_color="white", text_color=INK)
@@ -307,6 +447,8 @@ class InterpreterWindow(ctk.CTk):
     def set_opacity(self, value):
         self.opacity = float(value)
         self.attributes("-alpha", self.opacity)
+        if self.overlay is not None:
+            self.overlay.attributes("-alpha", self.opacity)
 
     def save_settings(self):
         try:
@@ -324,10 +466,15 @@ class InterpreterWindow(ctk.CTk):
         except Exception as exc:
             self.status.set(f"无法保存凭据 · {type(exc).__name__}")
             return
+        self.priority = list(self.pending_priority)
+        self.history_store.set_preference("priority", "|".join(self.priority))
+        self.history_store.set_preference("mode", self.mode.get())
+        self.history_store.set_preference("overlay", str(int(self.float_enabled.get())))
         self.set_panel(self.before_settings)
         self.status.set("设置已保存")
 
     def _select(self, sid):
+        self.cancel_title()
         self.view_id = sid
         self._header_state()
         self.transcript.configure(state="normal")
@@ -354,7 +501,7 @@ class InterpreterWindow(ctk.CTk):
 
     def _header_state(self):
         info = self.history_store.session(self.view_id) if self.view_id else None
-        self.heading.configure(text="中英同传" if not info else f"{datetime.fromtimestamp(info[1]):%m月%d日}同传")
+        self.heading.configure(text=self.history_store.title(self.view_id) if info else self.draft_title or "中英同传")
         if info:
             start = datetime.fromtimestamp(info[1])
             end = datetime.fromtimestamp(info[2]) if info[2] else None
@@ -379,7 +526,7 @@ class InterpreterWindow(ctk.CTk):
             stamp += datetime.fromtimestamp(ended).strftime("  –  %H:%M:%S")
         box.insert("end-1c", stamp + "\n", "stamp")
         box.insert("end-1c", original + "\n", "original")
-        box.insert("end-1c", (translated or "翻译中…") + "\n", "translation")
+        box.insert("end-1c", (translated or ("本段未取得译文" if final else "翻译中…")) + "\n", "translation")
         if final:
             box.mark_set("draft", "end-1c")
         box.configure(state="disabled")
@@ -395,6 +542,7 @@ class InterpreterWindow(ctk.CTk):
             self.status.set("请先点击头像暂停当前录制")
             return
         self.session_id = None
+        self.draft_title = ""
         if self.panel == "export":
             self.set_panel(None)
         self.select_session(None)
@@ -413,7 +561,7 @@ class InterpreterWindow(ctk.CTk):
         try:
             folder.mkdir(parents=True, exist_ok=True)
             for suffix, index in (("原文", 2), ("译文", 3)):
-                lines = [f"开始：{clock_text(start)}", f"结束：{clock_text(end) if end else '进行中'}", ""]
+                lines = [self.history_store.title(sid), f"开始：{clock_text(start)}", f"结束：{clock_text(end) if end else '进行中'}", ""]
                 lines += [f"[{clock_text(r[0])} – {clock_text(r[1])}] {r[index]}" for r in rows]
                 (folder / f"{stem}_{suffix}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
         except OSError as exc:
@@ -430,10 +578,12 @@ class InterpreterWindow(ctk.CTk):
             self._dock_state()
             self.status.set("正在保存最后一段…")
             return
-        deepseek = self.mode.get().startswith("DeepSeek")
-        credentials = ["deepseek_key"] if deepseek else ["tencent_appid", "tencent_id", "tencent_key"]
+        realtime = self.mode.get() == "腾讯云 实时"
+        candidates = ["腾讯云"] if realtime else self.priority
         try:
-            missing = any(not keyring.get_password(SERVICE, name) for name in credentials)
+            self.route_keys = {key: keyring.get_password(SERVICE, key) for name in candidates for key in KEYS[name]}
+            self.active_routes = [name for name in candidates if all(self.route_keys[key] for key in KEYS[name])]
+            missing = not self.active_routes
         except Exception:
             self.status.set("无法读取 Windows 凭据，请检查设置")
             return
@@ -449,7 +599,8 @@ class InterpreterWindow(ctk.CTk):
                                            blocksize=FRAME_SAMPLES, device=self.devices[self.device.get()], callback=self.capture)
             self.stream.start()
             if self.view_id is None:
-                sid = self.history_store.begin(self.mode.get())
+                sid = self.history_store.begin(self.active_routes[0], self.draft_title or None)
+                self.draft_title = ""
             else:
                 sid = self.view_id
                 self.history_store.resume(sid)
@@ -463,10 +614,12 @@ class InterpreterWindow(ctk.CTk):
         self.capture_started = time.time()
         self.status.set("正在收音")
         self._select(sid)
+        self.float_text.set("等待语音…")
+        self.update_overlay()
         if self.panel == "settings":
             for menu in self.options:
                 menu.configure(state="disabled")
-        backend = AudioBackend.deepseek_loop if deepseek else AudioBackend.tencent_loop
+        backend = AudioBackend.tencent_loop if realtime else priority_loop
         self.worker = threading.Thread(target=self._run, args=(backend,), daemon=True)
         self.worker.start()
 
@@ -498,6 +651,8 @@ class InterpreterWindow(ctk.CTk):
                 if sid is None or not (src or dst):
                     continue
                 self.partial = ("", "") if final else (src, dst)
+                if sid == self.session_id:
+                    self.float_text.set(dst or src)
                 if final:
                     self.history_store.append(sid, start, end, src, dst)
                 if self.view_id == sid:
@@ -511,6 +666,8 @@ class InterpreterWindow(ctk.CTk):
                 self._close_stream()
                 self.history_store.end(self.session_id)
                 self.recording = False
+                self.route_keys.clear()
+                self.close_overlay()
                 had_partial = any(self.partial)
                 self.partial = ("", "")
                 if self.view_id == self.session_id and (had_partial or not self.has_text):
@@ -518,7 +675,7 @@ class InterpreterWindow(ctk.CTk):
                 else:
                     self._header_state()
                     self._dock_state()
-                if self.status.get() in ("正在收音", "正在保存最后一段…"):
+                if self.status.get().startswith("正在收音") or self.status.get() == "正在保存最后一段…":
                     self.status.set("已暂停")
                 if self.panel == "settings":
                     for menu in self.options:
