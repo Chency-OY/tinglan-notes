@@ -110,7 +110,7 @@ class InterpreterWindow(ctk.CTk):
                      dropdown_fg_color="#FFFFFF", dropdown_hover_color=HOVER,
                      font=ctk.CTkFont(family=FONT, size=12))
         controls.grid_columnconfigure(1, weight=1)
-        self.mode_combo = ctk.CTkComboBox(controls, values=["DeepSeek 近实时", "腾讯云 实时"], variable=self.mode, width=128, **combo)
+        self.mode_combo = ctk.CTkComboBox(controls, values=["DeepSeek 近实时", "腾讯云 实时"], variable=self.mode, width=148, **combo)
         self.mode_combo.grid(row=0, column=0, padx=(0, 7))
         self.device_combo = ctk.CTkComboBox(controls, values=list(self.devices) or ["无可用麦克风"], variable=self.device, width=66, **combo)
         self.device_combo.grid(row=0, column=1, sticky="ew")
@@ -230,12 +230,12 @@ class InterpreterWindow(ctk.CTk):
         self.history_heading.pack(fill="x", padx=18)
         self.history_meta = ctk.CTkLabel(content, text="整场原文和译文会在这里按时间排列", text_color=MUTED, font=ctk.CTkFont(family=FONT, size=11), anchor="w")
         self.history_meta.pack(fill="x", padx=18, pady=(2, 6))
-        self.messages = ctk.CTkScrollableFrame(content, fg_color="#FFFFFF", corner_radius=14, scrollbar_button_color="#C8D7F0", scrollbar_button_hover_color="#AABEE4")
-        self.messages.pack(fill="both", expand=True, padx=12)
         actions = ctk.CTkFrame(content, fg_color="transparent")
-        actions.pack(fill="x", padx=12, pady=(5, 9))
+        actions.pack(side="bottom", fill="x", padx=12, pady=(5, 9))
         ui_button(actions, "继续这段对话", self.continue_selected, width=125).pack(side="left")
         ui_button(actions, "导出原文和译文", self.export_selected, width=140).pack(side="right")
+        self.messages = ctk.CTkScrollableFrame(content, height=60, fg_color="#FFFFFF", corner_radius=14, scrollbar_button_color="#C8D7F0", scrollbar_button_hover_color="#AABEE4")
+        self.messages.pack(fill="both", expand=True, padx=12)
 
     def highlight_selected(self):
         for session_id, button in self.session_buttons.items():
@@ -254,7 +254,10 @@ class InterpreterWindow(ctk.CTk):
         self.history_meta.configure(text=f"开始 {clock_text(session[1])}\n结束 {clock_text(session[2]) if session[2] else '进行中'}")
         for child in self.messages.winfo_children():
             child.destroy()
-        for started, ended, original, translated in self.history_store.segments(sid):
+        segments = self.history_store.segments(sid)
+        if not segments:
+            ctk.CTkLabel(self.messages, text="这段会话还没有字幕记录", text_color=MUTED).pack(pady=16)
+        for started, ended, original, translated in segments:
             ctk.CTkLabel(self.messages, text=f"{clock_text(started)}  →  {clock_text(ended)}", text_color="#A0ADC8", font=ctk.CTkFont(family=FONT, size=10)).pack(pady=(16, 7))
             for color, title, text, pad in ((PALE, "原文", original, (8, 35)), (ICE, "译文", translated, (35, 8))):
                 card = ctk.CTkFrame(self.messages, fg_color=color, corner_radius=13)
