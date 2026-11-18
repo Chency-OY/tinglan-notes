@@ -58,6 +58,8 @@ class InterpreterWindow(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.zoom = 1.0
         self.active_view = "subtitles"
+        self.sidebar_open = False
+        self.selected_session_id = None
         self.history_store = HistoryStore()
         self.session_id: int | None = None
         self.capture_started = 0.0
@@ -74,22 +76,31 @@ class InterpreterWindow(ctk.CTk):
         self.icon_image = None
         if (icon_dir / "icon.png").exists():
             self.icon_image = ctk.CTkImage(Image.open(icon_dir / "icon.png"), size=(34, 34))
+        self.workspace = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        self.workspace.pack(fill="both", expand=True)
+        self.workspace.grid_rowconfigure(0, weight=1)
+        self.workspace.grid_columnconfigure(1, weight=1)
+        self.content = ctk.CTkFrame(self.workspace, fg_color=BG, corner_radius=0)
+        self.content.grid(row=0, column=1, sticky="nsew")
+        self._build_sidebar()
         self._build_compact()
+        self._build_history()
         self.bind("<Configure>", self.on_resize)
         self.bind("<Control-MouseWheel>", self.on_zoom)
         self.after(80, self.poll)
 
     def _build_compact(self):
-        self.compact = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        self.compact = ctk.CTkFrame(self.content, fg_color=BG, corner_radius=0)
         self.compact.pack(fill="both", expand=True)
         header = ctk.CTkFrame(self.compact, fg_color="transparent")
         header.pack(fill="x", padx=20, pady=(16, 11))
+        self.history_toggle = ui_button(header, "☰ 历史", self.toggle_sidebar, width=66)
+        self.history_toggle.pack(side="left", padx=(0, 7))
         if self.icon_image:
             ctk.CTkLabel(header, text="", image=self.icon_image, width=36).pack(side="left", padx=(0, 8))
         ctk.CTkLabel(header, text="中英同传", text_color=INK, font=ctk.CTkFont(family=FONT, size=19, weight="bold")).pack(side="left")
         self.session_label = ctk.CTkLabel(header, text="新会话", text_color=MUTED, font=ctk.CTkFont(family=FONT, size=11))
         self.session_label.pack(side="left", padx=(10, 0), pady=(4, 0))
-        ui_button(header, "☰  历史", self.show_history, width=82).pack(side="right")
         ui_button(header, "设置", self.show_settings, width=58).pack(side="right", padx=(0, 4))
 
         controls = ctk.CTkFrame(self.compact, fg_color="transparent")
@@ -98,12 +109,13 @@ class InterpreterWindow(ctk.CTk):
                      button_color="#E8F0FF", button_hover_color="#DAE7FC", text_color=INK,
                      dropdown_fg_color="#FFFFFF", dropdown_hover_color=HOVER,
                      font=ctk.CTkFont(family=FONT, size=12))
-        self.mode_combo = ctk.CTkComboBox(controls, values=["DeepSeek 近实时", "腾讯云 实时"], variable=self.mode, width=170, **combo)
-        self.mode_combo.pack(side="left", padx=(0, 8))
-        self.device_combo = ctk.CTkComboBox(controls, values=list(self.devices) or ["无可用麦克风"], variable=self.device, **combo)
-        self.device_combo.pack(side="left", fill="x", expand=True)
-        self.start_button = ui_button(controls, "●  开始", self.toggle, primary=True, width=95)
-        self.start_button.pack(side="right", padx=(9, 0))
+        controls.grid_columnconfigure(1, weight=1)
+        self.mode_combo = ctk.CTkComboBox(controls, values=["DeepSeek 近实时", "腾讯云 实时"], variable=self.mode, width=128, **combo)
+        self.mode_combo.grid(row=0, column=0, padx=(0, 7))
+        self.device_combo = ctk.CTkComboBox(controls, values=list(self.devices) or ["无可用麦克风"], variable=self.device, width=66, **combo)
+        self.device_combo.grid(row=0, column=1, sticky="ew")
+        self.start_button = ui_button(controls, "●  开始", self.toggle, primary=True, width=76)
+        self.start_button.grid(row=0, column=2, padx=(7, 0))
 
         source_card = ctk.CTkFrame(self.compact, fg_color=PALE, corner_radius=14)
         source_card.pack(fill="x", padx=20, pady=(0, 9))
@@ -134,13 +146,16 @@ class InterpreterWindow(ctk.CTk):
     def on_resize(self, event=None):
         if self.active_view != "subtitles" or not hasattr(self, "source"):
             return
-        factor = min(self.winfo_width() / 760, self.winfo_height() / 355) * self.zoom
-        self.source.configure(font=ctk.CTkFont(family=FONT, size=max(11, min(23, round(13 * factor)))), wraplength=max(400, self.winfo_width() - 74))
-        self.target.configure(font=ctk.CTkFont(family=FONT, size=max(16, min(36, round(20 * factor))), weight="bold"), wraplength=max(400, self.winfo_width() - 74))
+        width = self.content.winfo_width()
+        scale = self.compact._get_widget_scaling()
+        factor = min(width / (760 * scale), self.winfo_height() / (355 * scale)) * self.zoom
+        wrap = max(100, round(width / scale) - 74)
+        self.source.configure(font=ctk.CTkFont(family=FONT, size=max(11, min(23, round(13 * factor)))), wraplength=wrap)
+        self.target.configure(font=ctk.CTkFont(family=FONT, size=max(16, min(36, round(20 * factor))), weight="bold"), wraplength=wrap)
 
     def open_view(self, name):
         self.compact_geometry = self.geometry()
-        self.compact.pack_forget()
+        self.workspace.pack_forget()
         self.active_view = name
         self.attributes("-topmost", False)
         self.attributes("-alpha", 1.0)
@@ -152,65 +167,103 @@ class InterpreterWindow(ctk.CTk):
 
     def back(self):
         self.page.destroy()
-        self.active_view = "subtitles"
         self.minsize(560, 290)
         self.geometry(self.compact_geometry)
-        self.compact.pack(fill="both", expand=True)
-        self.attributes("-alpha", self.opacity)
+        self.workspace.pack(fill="both", expand=True)
+        self.show_subtitles()
         self.attributes("-topmost", True)
-        self.on_resize()
 
-    def show_history(self):
-        page = self.open_view("history")
-        sidebar = ctk.CTkFrame(page, fg_color="#F0F5FF", corner_radius=0, width=270)
-        sidebar.pack(side="left", fill="y")
+    def show_subtitles(self):
+        self.history_panel.pack_forget()
+        self.active_view = "subtitles"
+        self.compact.pack(fill="both", expand=True)
+        if self.sidebar_open:
+            self.highlight_selected()
+        self.attributes("-alpha", self.opacity)
+        self.after_idle(self.on_resize)
+
+    def toggle_sidebar(self):
+        self.sidebar_open = not self.sidebar_open
+        if self.sidebar_open:
+            self.refresh_sessions()
+            self.sidebar.grid(row=0, column=0, sticky="ns")
+        else:
+            self.sidebar.grid_remove()
+        text = "收起" if self.sidebar_open else "☰ 历史"
+        self.history_toggle.configure(text=text)
+        self.detail_toggle.configure(text=text)
+        self.after_idle(self.on_resize)
+
+    def _build_sidebar(self):
+        sidebar = self.sidebar = ctk.CTkFrame(self.workspace, fg_color="#EDF3FC", corner_radius=0, width=180)
         sidebar.pack_propagate(False)
-        ui_button(sidebar, "←  返回字幕", self.back, width=110).pack(anchor="w", padx=15, pady=(20, 17))
-        ctk.CTkLabel(sidebar, text="历史对话", text_color=INK, font=ctk.CTkFont(family=FONT, size=21, weight="bold"), anchor="w").pack(fill="x", padx=23)
-        ui_button(sidebar, "＋  新会话", self.new_session_from_history, width=225).pack(padx=18, pady=(18, 18), fill="x")
-        ctk.CTkLabel(sidebar, text="最近", text_color=MUTED, font=ctk.CTkFont(family=FONT, size=11, weight="bold"), anchor="w").pack(fill="x", padx=23, pady=(0, 8))
+        top = ctk.CTkFrame(sidebar, fg_color="transparent")
+        top.pack(fill="x", padx=10, pady=(12, 3))
+        ctk.CTkLabel(top, text="历史对话", text_color=INK, font=ctk.CTkFont(family=FONT, size=14, weight="bold")).pack(side="left", padx=5)
+        ui_button(top, "‹ 收起", self.toggle_sidebar, width=58).pack(side="right")
+        ui_button(sidebar, "＋ 新会话", self.new_session_from_history).pack(padx=10, pady=(0, 7), fill="x")
         self.session_scroll = ctk.CTkScrollableFrame(sidebar, fg_color="transparent", scrollbar_button_color="#C8D7F0", scrollbar_button_hover_color="#AABEE4")
-        self.session_scroll.pack(fill="both", expand=True, padx=(10, 5), pady=(0, 12))
+        self.session_scroll.pack(fill="both", expand=True, padx=(5, 2), pady=(0, 9))
+
+    def refresh_sessions(self):
+        for child in self.session_scroll.winfo_children():
+            child.destroy()
         self.session_buttons = {}
         sessions = self.history_store.sessions()
+        if not sessions:
+            ctk.CTkLabel(self.session_scroll, text="暂无会话", text_color=MUTED).pack(anchor="w", padx=8)
         for sid, started, ended, provider in sessions:
             text = f"{datetime.fromtimestamp(started):%m月%d日  %H:%M}\n{provider}"
             button = ctk.CTkButton(self.session_scroll, text=text, height=62, corner_radius=10, anchor="w", fg_color="transparent", hover_color=HOVER, text_color="#52678F", font=ctk.CTkFont(family=FONT, size=12, weight="normal"), command=lambda session_id=sid: self.select_session(session_id))
             button.pack(fill="x", padx=4, pady=2)
             self.session_buttons[sid] = button
+        self.highlight_selected()
 
-        content = ctk.CTkFrame(page, fg_color=BG, corner_radius=0)
-        content.pack(side="left", fill="both", expand=True, padx=(30, 34), pady=(24, 24))
+    def _build_history(self):
+        content = self.history_panel = ctk.CTkFrame(self.content, fg_color=BG, corner_radius=0)
+        toolbar = ctk.CTkFrame(content, fg_color="transparent")
+        toolbar.pack(fill="x", padx=12, pady=(10, 2))
+        self.detail_toggle = ui_button(toolbar, "☰ 历史", self.toggle_sidebar, width=66)
+        self.detail_toggle.pack(side="left")
+        ui_button(toolbar, "返回字幕", self.show_subtitles, width=78).pack(side="right")
         self.history_heading = ctk.CTkLabel(content, text="选择一段对话", text_color=INK, font=ctk.CTkFont(family=FONT, size=23, weight="bold"), anchor="w")
-        self.history_heading.pack(fill="x")
+        self.history_heading.pack(fill="x", padx=18)
         self.history_meta = ctk.CTkLabel(content, text="整场原文和译文会在这里按时间排列", text_color=MUTED, font=ctk.CTkFont(family=FONT, size=11), anchor="w")
-        self.history_meta.pack(fill="x", pady=(2, 12))
+        self.history_meta.pack(fill="x", padx=18, pady=(2, 6))
         self.messages = ctk.CTkScrollableFrame(content, fg_color="#FFFFFF", corner_radius=14, scrollbar_button_color="#C8D7F0", scrollbar_button_hover_color="#AABEE4")
-        self.messages.pack(fill="both", expand=True)
+        self.messages.pack(fill="both", expand=True, padx=12)
         actions = ctk.CTkFrame(content, fg_color="transparent")
-        actions.pack(fill="x", pady=(14, 0))
+        actions.pack(fill="x", padx=12, pady=(5, 9))
         ui_button(actions, "继续这段对话", self.continue_selected, width=125).pack(side="left")
         ui_button(actions, "导出原文和译文", self.export_selected, width=140).pack(side="right")
-        self.selected_session_id = None
-        if sessions:
-            self.select_session(self.session_id if self.session_id in self.session_buttons else sessions[0][0])
+
+    def highlight_selected(self):
+        for session_id, button in self.session_buttons.items():
+            selected = self.active_view == "history" and session_id == self.selected_session_id
+            button.configure(fg_color="#DDE8FC" if selected else "transparent", text_color=INK if selected else "#52678F")
 
     def select_session(self, sid):
         self.selected_session_id = sid
-        for session_id, button in self.session_buttons.items():
-            button.configure(fg_color="#DDE8FC" if session_id == sid else "transparent", text_color=INK if session_id == sid else "#52678F")
+        self.active_view = "history"
+        self.compact.pack_forget()
+        self.history_panel.pack(fill="both", expand=True)
+        self.attributes("-alpha", 1.0)
+        self.highlight_selected()
         session = next(row for row in self.history_store.sessions() if row[0] == sid)
         self.history_heading.configure(text=f"会话 · {datetime.fromtimestamp(session[1]):%m月%d日 %H:%M}")
-        self.history_meta.configure(text=f"开始 {clock_text(session[1])}    结束 {clock_text(session[2]) if session[2] else '进行中'}")
+        self.history_meta.configure(text=f"开始 {clock_text(session[1])}\n结束 {clock_text(session[2]) if session[2] else '进行中'}")
         for child in self.messages.winfo_children():
             child.destroy()
         for started, ended, original, translated in self.history_store.segments(sid):
             ctk.CTkLabel(self.messages, text=f"{clock_text(started)}  →  {clock_text(ended)}", text_color="#A0ADC8", font=ctk.CTkFont(family=FONT, size=10)).pack(pady=(16, 7))
-            for color, title, text, pad in ((PALE, "原文", original, (12, 100)), (ICE, "译文", translated, (100, 12))):
+            for color, title, text, pad in ((PALE, "原文", original, (8, 35)), (ICE, "译文", translated, (35, 8))):
                 card = ctk.CTkFrame(self.messages, fg_color=color, corner_radius=13)
                 card.pack(fill="x", padx=pad, pady=(0, 6))
                 ctk.CTkLabel(card, text=title, text_color="#7287B0", font=ctk.CTkFont(family=FONT, size=10, weight="bold"), anchor="w").pack(fill="x", padx=16, pady=(11, 0))
-                ctk.CTkLabel(card, text=text, text_color=INK, font=ctk.CTkFont(family=FONT, size=13), anchor="w", justify="left", wraplength=460).pack(fill="x", padx=16, pady=(3, 13))
+                label = ctk.CTkLabel(card, text=text, text_color=INK, font=ctk.CTkFont(family=FONT, size=13), anchor="w", justify="left")
+                label.pack(fill="x", padx=12, pady=(3, 13))
+                card.bind("<Configure>", lambda event, message=label: message.configure(
+                    wraplength=max(80, round(event.width / message._get_widget_scaling()) - 24)))
 
     def new_session_from_history(self):
         if self.worker and self.worker.is_alive():
@@ -221,7 +274,7 @@ class InterpreterWindow(ctk.CTk):
         self.source.configure(text="说话后，原文会显示在这里")
         self.target.configure(text="翻译结果会显示在这里")
         self.status.set("下一次开始将创建新会话")
-        self.back()
+        self.show_subtitles()
 
     def continue_selected(self):
         sid = self.selected_session_id
@@ -237,7 +290,7 @@ class InterpreterWindow(ctk.CTk):
             self.source.configure(text=rows[-1][2])
             self.target.configure(text=rows[-1][3])
         self.status.set(f"已选择会话 #{sid}，点击开始后继续记录")
-        self.back()
+        self.show_subtitles()
 
     def export_selected(self):
         sid = self.selected_session_id
@@ -325,6 +378,8 @@ class InterpreterWindow(ctk.CTk):
         if self.session_id is None:
             self.session_id = self.history_store.begin(self.mode.get())
             self.session_label.configure(text=f"会话 #{self.session_id}")
+            if self.sidebar_open:
+                self.refresh_sessions()
         else:
             self.history_store.resume(self.session_id)
         self.worker.start()
