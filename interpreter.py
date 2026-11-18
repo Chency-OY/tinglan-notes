@@ -148,17 +148,35 @@ class Segmenter:
         return result
 
 
+class PillButton(tk.Canvas):
+    def __init__(self, parent, text, command, width=92, height=34, fill="#c8d3f6", foreground="#3a3360", background="#f1f6ff"):
+        super().__init__(parent, width=width, height=height, bg=background, highlightthickness=0, bd=0, cursor="hand2")
+        self.button_width, self.button_height = width, height
+        self.foreground = foreground
+        self.command = command
+        self.set_label(text, fill)
+        self.bind("<Button-1>", lambda event: self.command())
+
+    def set_label(self, text, fill):
+        self.delete("all")
+        h, w = self.button_height, self.button_width
+        r = h / 2
+        self.create_oval(0, 0, h, h, fill=fill, outline=fill)
+        self.create_oval(w - h, 0, w, h, fill=fill, outline=fill)
+        self.create_rectangle(r, 0, w - r, h, fill=fill, outline=fill)
+        self.create_text(w / 2, h / 2, text=text, fill=self.foreground, font=("Microsoft YaHei UI", 10, "bold"))
+
+
 class Interpreter(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.withdraw()
         self.title("中英同传字幕")
         icon_path = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "icon.ico"
         if icon_path.exists():
             self.iconbitmap(str(icon_path))
-        self.geometry("960x720+180+80")
-        self.minsize(650, 500)
-        self.configure(bg="#f8faff")
+        self.geometry("720x320+300+100")
+        self.minsize(540, 260)
+        self.configure(bg="#f1f6ff")
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.mode = tk.StringVar(value="DeepSeek 近实时")
         self.device = tk.StringVar()
@@ -170,164 +188,191 @@ class Interpreter(tk.Tk):
         self.stream = None
         self.live_sentence = ""
         self.zoom = 1.0
-        self.opacity = tk.DoubleVar(value=.85)
+        self.opacity = tk.DoubleVar(value=.88)
         self.history_store = HistoryStore()
         self.session_id: int | None = None
         self.capture_started = 0.0
         self.closing = False
         self._build()
-        self._build_overlay()
+        self.attributes("-topmost", True)
+        self.attributes("-alpha", self.opacity.get())
         self.after(80, self.poll)
 
+    # The compact subtitles and the conversation browser are views of one window.
     def _build(self):
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure("TCombobox", padding=7, fieldbackground="#ffffff", background="#ffffff", foreground="#3a3360")
-        style.configure("Treeview", background="#ffffff", fieldbackground="#ffffff", foreground="#3a3360", rowheight=28)
-        style.configure("Treeview.Heading", background="#e9efff", foreground="#3a3360", font=("Microsoft YaHei UI", 9, "bold"))
-
-        header = tk.Frame(self, bg="#f8faff")
-        header.pack(fill="x", padx=24, pady=(20, 14))
-        tk.Label(header, text="✦ 中英同传", bg="#f8faff", fg="#50689d", font=("Microsoft YaHei UI", 20, "bold")).pack(side="left")
-        tk.Label(header, text="  把每一句都好好记下来", bg="#f8faff", fg="#8d9bbd", font=("Microsoft YaHei UI", 10)).pack(side="left", pady=(9, 0))
-        zoom_bar = tk.Frame(header, bg="#f8faff")
-        zoom_bar.pack(side="right")
-        for text, action in (("−", lambda: self.set_zoom(-.1)), ("100%", lambda: self.set_zoom(0)), ("+", lambda: self.set_zoom(.1))):
-            tk.Button(zoom_bar, text=text, command=action, bg="#dce6fb", fg="#536a9b", activebackground="#cbd9f8", relief="flat", bd=0, padx=10, pady=5, cursor="hand2").pack(side="left", padx=2)
-        tk.Button(zoom_bar, text="☰  历史", command=self.show_history, bg="#dce6fb", fg="#536a9b", activebackground="#cbd9f8", relief="flat", bd=0, padx=12, pady=5, cursor="hand2").pack(side="left", padx=(9, 0))
-
-        bar = tk.Frame(self, bg="#ffffff", highlightbackground="#dfe7fb", highlightthickness=1)
-        bar.pack(fill="x", padx=22, pady=(0, 14))
-        inner = tk.Frame(bar, bg="#ffffff")
-        inner.pack(fill="x", padx=16, pady=13)
-        tk.Label(inner, text="翻译模式", bg="#ffffff", fg="#8291b4", font=("Microsoft YaHei UI", 9)).grid(row=0, column=0, sticky="w")
-        tk.Label(inner, text="麦克风", bg="#ffffff", fg="#8291b4", font=("Microsoft YaHei UI", 9)).grid(row=0, column=1, sticky="w", padx=(10, 0))
-        self.mode_combo = ttk.Combobox(inner, textvariable=self.mode, values=["DeepSeek 近实时", "腾讯云 实时"], state="readonly", width=17)
-        self.mode_combo.grid(row=1, column=0, sticky="ew", pady=(5, 0))
         devices = [(i, d["name"]) for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0]
         self.devices = {f"{i}: {name}": i for i, name in devices}
         names = list(self.devices)
         self.device.set(names[0] if names else "无可用麦克风")
-        self.device_combo = ttk.Combobox(inner, textvariable=self.device, values=names, state="readonly", width=24)
-        self.device_combo.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=(5, 0))
-        self.start_button = tk.Button(inner, text="●  开始", command=self.toggle, bg="#c8d3f6", fg="#3a3360", activebackground="#b6c6ef", relief="flat", bd=0, padx=16, pady=7, font=("Microsoft YaHei UI", 10, "bold"), cursor="hand2")
-        self.start_button.grid(row=1, column=2, padx=(12, 0), pady=(5, 0))
-        tk.Button(inner, text="⚙  设置", command=self.settings, bg="#eaf3fc", fg="#587da8", activebackground="#d9eaf9", relief="flat", bd=0, padx=12, pady=7, cursor="hand2").grid(row=1, column=3, padx=(8, 0), pady=(5, 0))
-        inner.grid_columnconfigure(0, weight=1)
-        inner.grid_columnconfigure(1, weight=2)
-
-        cards = tk.Frame(self, bg="#f8faff")
-        cards.pack(fill="x", padx=22, pady=(0, 14))
-        source_card = tk.Frame(cards, bg="#edf6ff", highlightbackground="#d9e8f8", highlightthickness=1)
-        source_card.pack(fill="x", pady=(0, 9))
-        tk.Label(source_card, text="原文  ORIGINAL", bg="#edf6ff", fg="#6686ae", font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w", padx=16, pady=(11, 3))
-        self.source = tk.Label(source_card, text="说话后，原文会显示在这里", anchor="w", justify="left", bg="#edf6ff", fg="#6b7b9e", font=("Microsoft YaHei UI", 12))
-        self.source.pack(fill="x", padx=16, pady=(0, 13))
-        target_card = tk.Frame(cards, bg="#eaf0ff", highlightbackground="#d8e1fa", highlightthickness=1)
-        target_card.pack(fill="x")
-        tk.Label(target_card, text="译文  TRANSLATION", bg="#eaf0ff", fg="#788dc1", font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w", padx=16, pady=(11, 3))
-        self.target = tk.Label(target_card, text="翻译结果会显示在这里", anchor="w", justify="left", bg="#eaf0ff", fg="#546a9e", font=("Microsoft YaHei UI", 17, "bold"))
-        self.target.pack(fill="x", padx=16, pady=(0, 13))
-
-        transcript_header = tk.Frame(self, bg="#f8faff")
-        transcript_header.pack(fill="x", padx=24, pady=(2, 8))
-        tk.Label(transcript_header, text="整场对话", bg="#f8faff", fg="#536a9b", font=("Microsoft YaHei UI", 13, "bold")).pack(side="left")
-        self.session_label = tk.Label(transcript_header, text="本次新会话", bg="#f8faff", fg="#a3aec5", font=("Microsoft YaHei UI", 9))
-        self.session_label.pack(side="left", padx=12, pady=(3, 0))
-        tk.Button(transcript_header, text="＋ 新会话", command=self.start_new_session, bg="#f4e8e8", fg="#8d6f91", activebackground="#efdde5", relief="flat", padx=10, pady=4, cursor="hand2").pack(side="right")
-
-        transcript_frame = tk.Frame(self, bg="#ffffff", highlightbackground="#dfe7fb", highlightthickness=1)
-        transcript_frame.pack(fill="both", expand=True, padx=22, pady=(0, 12))
-        scrollbar = ttk.Scrollbar(transcript_frame)
-        scrollbar.pack(side="right", fill="y")
-        self.transcript = tk.Text(transcript_frame, wrap="word", bg="#ffffff", fg="#4f5e85", insertbackground="#6179b4", relief="flat", padx=18, pady=16, font=("Microsoft YaHei UI", 10), yscrollcommand=scrollbar.set, state="disabled")
-        self.transcript.pack(fill="both", expand=True)
-        scrollbar.configure(command=self.transcript.yview)
-        self.transcript.tag_configure("time", foreground="#9ca9c2", font=("Microsoft YaHei UI", 9))
-        self.transcript.tag_configure("original", foreground="#6382ab")
-        self.transcript.tag_configure("translation", foreground="#536da8", font=("Microsoft YaHei UI", 11, "bold"))
-        self.transcript.tag_configure("empty", foreground="#a3aec5")
-        self._empty_transcript()
-
-        footer = tk.Frame(self, bg="#f8faff")
-        footer.pack(fill="x", padx=24, pady=(0, 16))
-        tk.Label(footer, text="●", bg="#f8faff", fg="#9fb5e4", font=("Segoe UI", 10)).pack(side="left")
-        tk.Label(footer, textvariable=self.status, bg="#f8faff", fg="#8291af", font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(5, 0))
-        tk.Button(footer, text="显示 / 隐藏悬浮字幕", command=self.toggle_overlay, bg="#dce6fb", fg="#536a9b", activebackground="#cbd9f8", relief="flat", padx=12, pady=5, cursor="hand2").pack(side="right")
-        self.hint_label = tk.Label(footer, text="拖动边缘改变窗口大小  ·  Ctrl + 滚轮调字幕", bg="#f8faff", fg="#a3aec5", font=("Microsoft YaHei UI", 9))
-        self.hint_label.pack(side="right", padx=(0, 12))
+        self.active_view = "subtitles"
+        self.compact_view = tk.Frame(self, bg="#f1f6ff")
+        self.compact_view.pack(fill="both", expand=True)
+        top = tk.Frame(self.compact_view, bg="#f1f6ff")
+        top.pack(fill="x", padx=18, pady=(12, 8))
+        tk.Label(top, text="✦ 同传字幕", bg="#f1f6ff", fg="#536a9b", font=("Microsoft YaHei UI", 12, "bold")).pack(side="left")
+        self.session_label = tk.Label(top, text="新会话", bg="#f1f6ff", fg="#8d9bbd", font=("Microsoft YaHei UI", 9))
+        self.session_label.pack(side="left", padx=(9, 0))
+        PillButton(top, "历史", self.show_history, width=72, fill="#dce6fb").pack(side="right", padx=(7, 0))
+        PillButton(top, "设置", self.settings, width=72, fill="#dce6fb").pack(side="right")
+        controls = tk.Frame(self.compact_view, bg="#f1f6ff")
+        controls.pack(fill="x", padx=19, pady=(0, 10))
+        self.mode_combo = ttk.Combobox(controls, textvariable=self.mode, values=["DeepSeek 近实时", "腾讯云 实时"], state="readonly", width=15)
+        self.mode_combo.pack(side="left", padx=(0, 8))
+        self.device_combo = ttk.Combobox(controls, textvariable=self.device, values=names, state="readonly", width=22)
+        self.device_combo.pack(side="left", fill="x", expand=True)
+        self.start_button = PillButton(controls, "● 开始", self.toggle, width=91, fill="#c8d3f6")
+        self.start_button.pack(side="right", padx=(9, 0))
+        source_card = tk.Frame(self.compact_view, bg="#eaf2ff")
+        source_card.pack(fill="x", padx=18, pady=(0, 7))
+        tk.Label(source_card, text="原文", bg="#eaf2ff", fg="#7385ad", font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w", padx=13, pady=(8, 2))
+        self.source = tk.Label(source_card, text="原文会显示在这里", bg="#eaf2ff", fg="#5c719c", anchor="w", justify="left", font=("Microsoft YaHei UI", 12))
+        self.source.pack(fill="x", padx=13, pady=(0, 9))
+        target_card = tk.Frame(self.compact_view, bg="#dfe9ff")
+        target_card.pack(fill="both", expand=True, padx=18, pady=(0, 7))
+        tk.Label(target_card, text="译文", bg="#dfe9ff", fg="#6c7fac", font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w", padx=13, pady=(8, 2))
+        self.target = tk.Label(target_card, text="翻译会显示在这里", bg="#dfe9ff", fg="#3a3360", anchor="w", justify="left", font=("Microsoft YaHei UI", 19, "bold"))
+        self.target.pack(fill="both", expand=True, padx=13, pady=(0, 9))
+        footer = tk.Frame(self.compact_view, bg="#f1f6ff")
+        footer.pack(fill="x", padx=19, pady=(0, 9))
+        tk.Label(footer, textvariable=self.status, bg="#f1f6ff", fg="#8291af", font=("Microsoft YaHei UI", 9)).pack(side="left")
+        tk.Scale(footer, from_=.55, to=1.0, resolution=.05, orient="horizontal", variable=self.opacity,
+                 command=lambda value: self.attributes("-alpha", float(value)) if self.active_view == "subtitles" else None,
+                 showvalue=False, length=110, bg="#f1f6ff", activebackground="#abb3e2", troughcolor="#d5dff6", highlightthickness=0, bd=0).pack(side="right")
+        tk.Label(footer, text="透明度", bg="#f1f6ff", fg="#8d9bbd", font=("Microsoft YaHei UI", 9)).pack(side="right")
         self.bind("<Configure>", self.on_resize)
         self.bind("<Control-MouseWheel>", lambda event: self.set_zoom(.1 if event.delta > 0 else -.1))
         self.after_idle(self.on_resize)
 
-    def _build_overlay(self):
-        self.overlay = tk.Toplevel(self)
-        self.overlay.title("同传悬浮字幕")
-        self.overlay.geometry("690x285+400+70")
-        self.overlay.minsize(520, 230)
-        self.overlay.configure(bg="#edf3ff")
-        self.overlay.attributes("-topmost", True)
-        self.overlay.attributes("-alpha", self.opacity.get())
-        self.overlay.protocol("WM_DELETE_WINDOW", self.close)
-        top = tk.Frame(self.overlay, bg="#edf3ff")
-        top.pack(fill="x", padx=15, pady=(9, 3))
-        tk.Label(top, text="✦ 同传字幕", bg="#edf3ff", fg="#6179b4", font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
-        tk.Button(top, text="×", command=self.close, bg="#edf3ff", fg="#8d9bbd", activebackground="#e0e9fa", relief="flat", font=("Segoe UI", 13), cursor="hand2").pack(side="right")
-        tk.Scale(top, from_=.55, to=1.0, resolution=.05, orient="horizontal", variable=self.opacity,
-                 command=lambda value: self.overlay.attributes("-alpha", float(value)), length=110,
-                 showvalue=False, bg="#edf3ff", activebackground="#aabbe8", troughcolor="#d5dff6",
-                 highlightthickness=0, bd=0).pack(side="right", padx=(4, 0))
-        tk.Label(top, text="透明度", bg="#edf3ff", fg="#8d9bbd", font=("Microsoft YaHei UI", 9)).pack(side="right")
-        tk.Button(top, text="历史对话", command=self.show_history, bg="#dce6fb", fg="#536a9b", activebackground="#cbd9f8", relief="flat", padx=9, pady=3, cursor="hand2").pack(side="right", padx=(0, 9))
-        tk.Button(top, text="设置", command=self.settings, bg="#dce6fb", fg="#536a9b", activebackground="#cbd9f8", relief="flat", padx=9, pady=3, cursor="hand2").pack(side="right", padx=(0, 5))
+    def set_zoom(self, change):
+        self.zoom = 1.0 if change == 0 else min(1.8, max(.7, self.zoom + change))
+        self.on_resize()
 
-        controls = tk.Frame(self.overlay, bg="#edf3ff")
-        controls.pack(fill="x", padx=18, pady=(4, 8))
-        self.mode_combo = ttk.Combobox(controls, textvariable=self.mode, values=["DeepSeek 近实时", "腾讯云 实时"], state="readonly", width=15)
-        self.mode_combo.pack(side="left", padx=(0, 8))
-        self.device_combo = ttk.Combobox(controls, textvariable=self.device, values=list(self.devices), state="readonly", width=25)
-        self.device_combo.pack(side="left", fill="x", expand=True)
-        self.start_button = tk.Button(controls, text="●  开始", command=self.toggle, bg="#c8d3f6", fg="#3a3360", activebackground="#b6c6ef", relief="flat", padx=14, pady=6, font=("Microsoft YaHei UI", 10, "bold"), cursor="hand2")
-        self.start_button.pack(side="right", padx=(9, 0))
-        self.overlay_source = tk.Label(self.overlay, text="原文会显示在这里", bg="#edf3ff", fg="#6a7fa6", anchor="w", justify="left", font=("Microsoft YaHei UI", 12))
-        self.overlay_source.pack(fill="x", padx=19, pady=(3, 4))
-        self.overlay_target = tk.Label(self.overlay, text="翻译会显示在这里", bg="#edf3ff", fg="#546a9e", anchor="w", justify="left", font=("Microsoft YaHei UI", 20, "bold"))
-        self.overlay_target.pack(fill="both", expand=True, padx=19, pady=(0, 4))
-        tk.Label(self.overlay, textvariable=self.status, bg="#edf3ff", fg="#8291af", anchor="w", font=("Microsoft YaHei UI", 9)).pack(fill="x", padx=19, pady=(0, 8))
-        self.overlay.bind("<Configure>", self.on_overlay_resize)
-        self.overlay.bind("<Control-MouseWheel>", lambda event: self.set_zoom(.1 if event.delta > 0 else -.1))
-        self.after_idle(self.on_overlay_resize)
+    def on_resize(self, event=None):
+        if self.active_view != "subtitles":
+            return
+        width, height = self.winfo_width(), self.winfo_height()
+        factor = min(width / 720, height / 320) * self.zoom
+        self.source.configure(font=("Microsoft YaHei UI", max(10, min(22, round(12 * factor)))), wraplength=max(380, width - 65))
+        self.target.configure(font=("Microsoft YaHei UI", max(15, min(36, round(19 * factor))), "bold"), wraplength=max(380, width - 65))
 
-    def toggle_overlay(self):
-        if self.overlay.state() == "withdrawn":
-            self.overlay.deiconify()
-            self.overlay.lift()
-        else:
-            self.overlay.withdraw()
+    def _open_page(self, name):
+        self.compact_geometry = self.geometry()
+        self.compact_view.pack_forget()
+        self.active_view = name
+        self.attributes("-topmost", False)
+        self.attributes("-alpha", 1.0)
+        self.minsize(760, 500)
+        self.geometry("1000x650+180+70")
+        self.page_view = tk.Frame(self, bg="#f8faff")
+        self.page_view.pack(fill="both", expand=True)
+        return self.page_view
 
-    def _empty_transcript(self):
-        self.transcript.configure(state="normal")
-        self.transcript.delete("1.0", "end")
-        self.transcript.insert("end", "开始说话后，这里会按时间整理整场对话。\n", "empty")
-        self.transcript.configure(state="disabled")
+    def back_to_subtitles(self):
+        self.page_view.destroy()
+        self.active_view = "subtitles"
+        self.minsize(540, 260)
+        self.geometry(self.compact_geometry)
+        self.compact_view.pack(fill="both", expand=True)
+        self.attributes("-alpha", self.opacity.get())
+        self.attributes("-topmost", True)
+        self.on_resize()
 
-    def append_transcript(self, started, ended, source, target):
-        self.transcript.configure(state="normal")
-        if self.transcript.get("1.0", "1.end").startswith("开始说话后"):
-            self.transcript.delete("1.0", "end")
-        self.transcript.insert("end", f"{clock_text(started)}  →  {clock_text(ended)}\n", "time")
-        self.transcript.insert("end", f"原文  {source}\n", "original")
-        self.transcript.insert("end", f"译文  {target}\n\n", "translation")
-        self.transcript.configure(state="disabled")
-        self.transcript.see("end")
+    def show_history(self):
+        page = self._open_page("history")
+        header = tk.Frame(page, bg="#f8faff")
+        header.pack(fill="x", padx=24, pady=(20, 14))
+        PillButton(header, "← 返回", self.back_to_subtitles, width=90, fill="#dce6fb", background="#f8faff").pack(side="left")
+        tk.Label(header, text="历史对话", bg="#f8faff", fg="#3a3360", font=("Microsoft YaHei UI", 19, "bold")).pack(side="left", padx=(17, 0))
+        body = tk.Frame(page, bg="#f8faff")
+        body.pack(fill="both", expand=True, padx=22, pady=(0, 20))
+        sidebar = tk.Frame(body, bg="#edf3ff", width=250)
+        sidebar.pack(side="left", fill="y", padx=(0, 12))
+        sidebar.pack_propagate(False)
+        tk.Label(sidebar, text="全部会话", bg="#edf3ff", fg="#536a9b", font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w", padx=16, pady=(17, 10))
+        sessions = self.history_store.sessions()
+        session_list = tk.Listbox(sidebar, bg="#edf3ff", fg="#536a9b", selectbackground="#c8d3f6", selectforeground="#3a3360", relief="flat", borderwidth=0, highlightthickness=0, activestyle="none", font=("Microsoft YaHei UI", 10))
+        session_list.pack(fill="both", expand=True, padx=10, pady=(0, 12))
+        for sid, started, ended, provider in sessions:
+            session_list.insert("end", f"  {datetime.fromtimestamp(started):%m月%d日 %H:%M} · {provider}")
+        def new_session():
+            if self.worker and self.worker.is_alive():
+                self.start_new_session()
+                return
+            self.start_new_session()
+            self.back_to_subtitles()
+        PillButton(sidebar, "＋ 新会话", new_session, width=205, fill="#f4e8e8", background="#edf3ff").pack(pady=(0, 16))
+
+        content = tk.Frame(body, bg="#ffffff", highlightbackground="#dfe7fb", highlightthickness=1)
+        content.pack(side="left", fill="both", expand=True)
+        heading = tk.Label(content, text="选择左侧会话", bg="#ffffff", fg="#3a3360", font=("Microsoft YaHei UI", 14, "bold"))
+        heading.pack(anchor="w", padx=22, pady=(18, 3))
+        meta = tk.Label(content, text="整场对话会显示在这里", bg="#ffffff", fg="#8d9bbd", font=("Microsoft YaHei UI", 9))
+        meta.pack(anchor="w", padx=22, pady=(0, 12))
+        detail = tk.Text(content, wrap="word", bg="#ffffff", fg="#4f5e85", relief="flat", padx=22, pady=14, font=("Microsoft YaHei UI", 11), state="disabled")
+        detail.pack(fill="both", expand=True)
+        detail.tag_configure("time", foreground="#9ca9c2", font=("Microsoft YaHei UI", 9))
+        detail.tag_configure("source", background="#edf3ff", foreground="#4f5e85", spacing1=8, spacing3=8)
+        detail.tag_configure("target", background="#dfe9ff", foreground="#3a3360", font=("Microsoft YaHei UI", 11, "bold"), spacing1=8, spacing3=8)
+        selected_sid = [None]
+        def render_selected(_=None):
+            selection = session_list.curselection()
+            sid = sessions[selection[0]][0] if selection else None
+            selected_sid[0] = sid
+            detail.configure(state="normal")
+            detail.delete("1.0", "end")
+            if sid is not None:
+                row = sessions[selection[0]]
+                heading.configure(text=f"会话 #{sid}")
+                meta.configure(text=f"{clock_text(row[1])}  —  {clock_text(row[2]) if row[2] else '进行中'}")
+                for start, end, source, target in self.history_store.segments(sid):
+                    detail.insert("end", f"{clock_text(start)}  →  {clock_text(end)}\n", "time")
+                    detail.insert("end", f"  原文  {source}\n", "source")
+                    detail.insert("end", f"  译文  {target}\n\n", "target")
+            detail.configure(state="disabled")
+        session_list.bind("<<ListboxSelect>>", render_selected)
+        self.history_refresh = render_selected
+        if sessions:
+            preferred = next((i for i, row in enumerate(sessions) if row[0] == self.session_id), 0)
+            session_list.selection_set(preferred)
+            render_selected()
+        actions = tk.Frame(content, bg="#ffffff")
+        actions.pack(fill="x", padx=22, pady=(8, 16))
+        def continue_session():
+            if selected_sid[0] is None:
+                return
+            if self.worker and self.worker.is_alive():
+                messagebox.showinfo("请先暂停", "先暂停当前录音，再继续历史会话。", parent=self)
+                return
+            self.load_session(selected_sid[0])
+            self.back_to_subtitles()
+        def export():
+            sid = selected_sid[0]
+            if sid is None:
+                return
+            folder = filedialog.askdirectory(parent=self, title="选择导出文件夹")
+            if not folder:
+                return
+            rows = self.history_store.segments(sid)
+            session = next(row for row in self.history_store.sessions() if row[0] == sid)
+            stem = f"会话_{datetime.fromtimestamp(session[1]):%Y%m%d_%H%M%S}_{sid}"
+            for suffix, index in (("原文", 2), ("译文", 3)):
+                lines = [f"开始：{clock_text(session[1])}", f"结束：{clock_text(session[2]) if session[2] else '进行中'}", ""]
+                lines += [f"[{clock_text(row[0])} – {clock_text(row[1])}] {row[index]}" for row in rows]
+                (Path(folder) / f"{stem}_{suffix}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            messagebox.showinfo("导出完成", "已分别保存原文和译文两个 TXT 文件。", parent=self)
+        PillButton(actions, "继续此会话", continue_session, width=128, fill="#dce6fb", background="#ffffff").pack(side="left")
+        PillButton(actions, "导出原文和译文", export, width=160, fill="#dce6fb", background="#ffffff").pack(side="right")
 
     def load_session(self, sid):
         self.session_id = sid
-        self._empty_transcript()
         rows = self.history_store.segments(sid)
-        for row in rows:
-            self.append_transcript(*row)
-        self.session_label.configure(text=f"历史会话 #{sid} · {len(rows)} 段")
+        self.session_label.configure(text=f"会话 #{sid}")
+        if rows:
+            self.source.configure(text=rows[-1][2])
+            self.target.configure(text=rows[-1][3])
         self.status.set(f"已选择历史会话 #{sid}，点击开始后继续记录")
 
     def start_new_session(self):
@@ -335,138 +380,28 @@ class Interpreter(tk.Tk):
             messagebox.showinfo("请先暂停", "先暂停当前录音，再新建会话。", parent=self)
             return
         self.session_id = None
-        self._empty_transcript()
-        self.session_label.configure(text="本次新会话")
-        self.source.configure(text="说话后，原文会显示在这里")
-        self.target.configure(text="翻译结果会显示在这里")
-        self.overlay_source.configure(text="原文会显示在这里")
-        self.overlay_target.configure(text="翻译会显示在这里")
+        self.session_label.configure(text="新会话")
+        self.source.configure(text="原文会显示在这里")
+        self.target.configure(text="翻译会显示在这里")
         self.status.set("下一次开始将创建新会话")
 
-    def set_zoom(self, change):
-        self.zoom = 1.0 if change == 0 else min(1.8, max(.7, self.zoom + change))
-        self.on_resize()
-        self.on_overlay_resize()
-
-    def on_resize(self, event=None):
-        width, height = self.winfo_width(), self.winfo_height()
-        factor = min(width / 960, height / 720) * self.zoom
-        self.source.configure(font=("Microsoft YaHei UI", max(10, min(21, round(12 * factor)))), wraplength=max(400, width - 86))
-        self.target.configure(font=("Microsoft YaHei UI", max(14, min(30, round(17 * factor))), "bold"), wraplength=max(400, width - 86))
-        if width < 850:
-            self.hint_label.pack_forget()
-        elif not self.hint_label.winfo_manager():
-            self.hint_label.pack(side="right", padx=(0, 10))
-
-    def on_overlay_resize(self, event=None):
-        if not hasattr(self, "overlay"):
-            return
-        width, height = self.overlay.winfo_width(), self.overlay.winfo_height()
-        factor = min(width / 690, height / 285) * self.zoom
-        self.overlay_source.configure(font=("Microsoft YaHei UI", max(10, min(22, round(12 * factor)))), wraplength=max(320, width - 44))
-        self.overlay_target.configure(font=("Microsoft YaHei UI", max(15, min(36, round(20 * factor))), "bold"), wraplength=max(320, width - 44))
-
-    def show_history(self):
-        dialog = tk.Toplevel(self)
-        dialog.title("会话历史")
-        dialog.geometry("960x600")
-        dialog.minsize(720, 440)
-        dialog.attributes("-topmost", True)
-        dialog.configure(bg="#f8faff")
-        tk.Label(dialog, text="✦ 历史对话", bg="#f8faff", fg="#536a9b", font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w", padx=20, pady=(15, 12))
-        body = tk.Frame(dialog, bg="#f8faff")
-        body.pack(fill="both", expand=True, padx=18)
-        sidebar = tk.Frame(body, bg="#edf3ff", width=295)
-        sidebar.pack(side="left", fill="y", padx=(0, 12))
-        sidebar.pack_propagate(False)
-        tk.Label(sidebar, text="全部会话", bg="#edf3ff", fg="#6179b4", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", padx=13, pady=(13, 8))
-        tree = ttk.Treeview(sidebar, columns=("start", "end"), show="headings", selectmode="browse")
-        for col, title, width in (("start", "开始", 145), ("end", "结束", 145)):
-            tree.heading(col, text=title)
-            tree.column(col, width=width)
-        tree.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        for sid, started, ended, provider in self.history_store.sessions():
-            tree.insert("", "end", iid=str(sid), values=(datetime.fromtimestamp(started).strftime("%m-%d %H:%M"), datetime.fromtimestamp(ended).strftime("%m-%d %H:%M") if ended else "进行中"))
-        conversation = tk.Frame(body, bg="#ffffff", highlightbackground="#dfe7fb", highlightthickness=1)
-        conversation.pack(side="left", fill="both", expand=True)
-        session_heading = tk.Label(conversation, text="选择左侧会话查看完整对话", bg="#ffffff", fg="#536a9b", font=("Microsoft YaHei UI", 11, "bold"))
-        session_heading.pack(anchor="w", padx=18, pady=(15, 8))
-        detail_scroll = ttk.Scrollbar(conversation)
-        detail_scroll.pack(side="right", fill="y")
-        detail = tk.Text(conversation, wrap="word", bg="#ffffff", fg="#4f5e85", insertbackground="#536a9b", relief="flat", padx=18, pady=12, font=("Microsoft YaHei UI", 10), yscrollcommand=detail_scroll.set)
-        detail.pack(fill="both", expand=True)
-        detail_scroll.configure(command=detail.yview)
-        detail.tag_configure("time", foreground="#9ca9c2", font=("Microsoft YaHei UI", 9))
-        detail.tag_configure("source", foreground="#6382ab")
-        detail.tag_configure("target", foreground="#536da8", font=("Microsoft YaHei UI", 11, "bold"))
-        detail.configure(state="disabled")
-        def selected_id():
-            selected = tree.selection()
-            return int(selected[0]) if selected else None
-        def show_selected(_=None):
-            sid = selected_id()
-            detail.configure(state="normal")
-            detail.delete("1.0", "end")
-            if sid is not None:
-                session = next(row for row in self.history_store.sessions() if row[0] == sid)
-                session_heading.configure(text=f"会话 #{sid}  ·  {clock_text(session[1])} — {clock_text(session[2]) if session[2] else '进行中'}")
-                for start, end, source, target in self.history_store.segments(sid):
-                    detail.insert("end", f"{clock_text(start)}  →  {clock_text(end)}\n", "time")
-                    detail.insert("end", f"原文  {source}\n", "source")
-                    detail.insert("end", f"译文  {target}\n\n", "target")
-            detail.configure(state="disabled")
-        tree.bind("<<TreeviewSelect>>", show_selected)
-        if tree.get_children():
-            preferred = str(self.session_id) if self.session_id is not None and tree.exists(str(self.session_id)) else tree.get_children()[0]
-            tree.selection_set(preferred)
-            show_selected()
-        actions = tk.Frame(dialog, bg="#f8faff")
-        actions.pack(fill="x", padx=18, pady=(0, 14))
-        def continue_session():
-            sid = selected_id()
-            if sid is None: return
-            if self.worker and self.worker.is_alive():
-                messagebox.showinfo("请先暂停", "先暂停当前录音，再选择要继续的历史会话。", parent=dialog)
-                return
-            self.load_session(sid)
-            dialog.destroy()
-        def new_session():
-            if self.worker and self.worker.is_alive():
-                messagebox.showinfo("请先暂停", "先暂停当前录音，再新建会话。", parent=dialog)
-                return
-            self.start_new_session()
-            dialog.destroy()
-        def export():
-            sid = selected_id()
-            if sid is None: return
-            folder = filedialog.askdirectory(parent=dialog, title="选择导出文件夹")
-            if not folder: return
-            rows = self.history_store.segments(sid)
-            session = next(row for row in self.history_store.sessions() if row[0] == sid)
-            stem = f"会话_{datetime.fromtimestamp(session[1]):%Y%m%d_%H%M%S}_{sid}"
-            for suffix, index in (("原文", 2), ("译文", 3)):
-                lines = [f"开始：{clock_text(session[1])}", f"结束：{clock_text(session[2]) if session[2] else '进行中'}", ""]
-                lines += [f"[{clock_text(start)} – {clock_text(end)}] {row[index]}" for row in rows for start, end in [(row[0], row[1])]]
-                (Path(folder) / f"{stem}_{suffix}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-            messagebox.showinfo("导出完成", "已分别保存原文和译文两个 TXT 文件。", parent=dialog)
-        for label, command in (("继续此会话", continue_session), ("新会话", new_session), ("分别导出原文和译文", export)):
-            tk.Button(actions, text=label, command=command, bg="#dce6fb", fg="#536a9b", activebackground="#cbd9f8", relief="flat", padx=12, pady=7).pack(side="left", padx=(0, 8))
-
     def settings(self):
-        dialog = tk.Toplevel(self)
-        dialog.title("服务密钥")
-        dialog.geometry("540x320")
-        dialog.attributes("-topmost", True)
-        dialog.configure(bg="#f8faff")
-        tk.Label(dialog, text="✦ 服务设置", bg="#f8faff", fg="#536a9b", font=("Microsoft YaHei UI", 15, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", padx=20, pady=(18, 10))
+        page = self._open_page("settings")
+        header = tk.Frame(page, bg="#f8faff")
+        header.pack(fill="x", padx=24, pady=(20, 24))
+        PillButton(header, "← 返回", self.back_to_subtitles, width=90, fill="#dce6fb", background="#f8faff").pack(side="left")
+        tk.Label(header, text="服务设置", bg="#f8faff", fg="#3a3360", font=("Microsoft YaHei UI", 19, "bold")).pack(side="left", padx=(17, 0))
+        form = tk.Frame(page, bg="#ffffff", highlightbackground="#dfe7fb", highlightthickness=1)
+        form.pack(fill="x", padx=80, pady=(0, 20))
         fields = [("DeepSeek API Key", "deepseek_key"), ("腾讯云 AppID", "tencent_appid"), ("腾讯云 SecretId", "tencent_id"), ("腾讯云 SecretKey", "tencent_key")]
         entries = {}
         for row, (label, account) in enumerate(fields):
-            tk.Label(dialog, text=label, bg="#f8faff", fg="#7385ad").grid(row=row+1, column=0, padx=(20, 8), pady=9, sticky="w")
-            entry = ttk.Entry(dialog, width=43, show="*" if "Key" in label or "Secret" in label else "")
-            entry.grid(row=row+1, column=1, padx=(4, 20), pady=9)
+            tk.Label(form, text=label, bg="#ffffff", fg="#536a9b").grid(row=row, column=0, padx=(25, 18), pady=16, sticky="w")
+            entry = ttk.Entry(form, width=55, show="*" if "Key" in label or "Secret" in label else "")
+            entry.grid(row=row, column=1, padx=(0, 25), pady=16, sticky="ew")
             entry.insert(0, keyring.get_password(SERVICE, account) or "")
             entries[account] = entry
+        form.grid_columnconfigure(1, weight=1)
         def save():
             for account, entry in entries.items():
                 value = entry.get().strip()
@@ -475,15 +410,15 @@ class Interpreter(tk.Tk):
                 else:
                     try: keyring.delete_password(SERVICE, account)
                     except keyring.errors.PasswordDeleteError: pass
-            dialog.destroy()
-        tk.Button(dialog, text="保存设置", command=save, bg="#c8d3f6", fg="#3a3360", activebackground="#b6c6ef", relief="flat", padx=18, pady=7).grid(row=5, column=1, sticky="e", padx=20, pady=15)
+            self.back_to_subtitles()
+        PillButton(page, "保存设置", save, width=120, fill="#c8d3f6", background="#f8faff").pack(anchor="e", padx=80)
 
     def toggle(self):
         if self.worker and self.worker.is_alive():
             self.stop_event.set()
             if self.stream: self.stream.stop(); self.stream.close(); self.stream = None
             if self.session_id is not None: self.history_store.end(self.session_id)
-            self.start_button.configure(text="●  开始", bg="#c8d3f6")
+            self.start_button.set_label("● 开始", "#c8d3f6")
             self.mode_combo.configure(state="readonly")
             self.device_combo.configure(state="readonly")
             self.status.set("正在停止")
@@ -513,7 +448,7 @@ class Interpreter(tk.Tk):
         else:
             self.history_store.resume(self.session_id)
         self.worker.start()
-        self.start_button.configure(text="Ⅱ  暂停", bg="#f3d399")
+        self.start_button.set_label("Ⅱ 暂停", "#f3d399")
         self.mode_combo.configure(state="disabled")
         self.device_combo.configure(state="disabled")
         self.status.set("正在收音")
@@ -611,19 +546,17 @@ class Interpreter(tk.Tk):
                 event = self.events.get_nowait()
                 if event[0] in ("pair", "final_pair"):
                     self.source.configure(text=event[3]); self.target.configure(text=event[4])
-                    self.overlay_source.configure(text=event[3]); self.overlay_target.configure(text=event[4])
                     if event[0] == "final_pair" and event[5] is not None and (event[3] or event[4]):
                         self.history_store.append(event[5], event[1], event[2], event[3], event[4])
-                        if event[5] == self.session_id:
-                            self.append_transcript(event[1], event[2], event[3], event[4])
+                        if self.active_view == "history":
+                            self.history_refresh()
                 elif event[0] == "source":
                     self.source.configure(text=event[1]); self.target.configure(text="翻译中…")
-                    self.overlay_source.configure(text=event[1]); self.overlay_target.configure(text="翻译中…")
                 elif event[0] == "status": self.status.set(event[1])
                 elif event[0] == "stopped":
                     if self.stream: self.stream.stop(); self.stream.close(); self.stream = None
                     if self.session_id is not None: self.history_store.end(self.session_id)
-                    self.start_button.configure(text="●  开始", bg="#c8d3f6")
+                    self.start_button.set_label("● 开始", "#c8d3f6")
                     self.mode_combo.configure(state="readonly")
                     self.device_combo.configure(state="readonly")
         except queue.Empty: pass

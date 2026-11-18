@@ -1,13 +1,13 @@
 # 中英同传 · 会议与课堂字幕
 
-Windows 麦克风同传软件。启动时只显示半透明悬浮字幕窗，方便放在 PPT 上方；点击“历史对话”可进入会话页面，按时间查看整场对话。支持 DeepSeek 近实时模式与腾讯云实时模式，可自动中英互译。
+Windows 麦克风同传软件。只有一个窗口：平时是半透明悬浮字幕，方便放在 PPT 上方；点击“历史”会在同一窗口切换到聊天式会话页面，点击“返回”恢复字幕。设置也在同一窗口内。界面使用浅冰蓝和简洁圆角控件。支持 DeepSeek 近实时模式与腾讯云实时模式，可自动中英互译。
 
 ## 使用
 
 1. 双击 `ZhEnInterpreter.exe` 启动。若从 GitHub 获取源码，请按下方“打包”步骤生成 EXE。
 2. 点击“密钥设置”。DeepSeek 模式填 DeepSeek API Key；腾讯云模式填 AppID、SecretId、SecretKey。凭据只保存在当前 Windows 用户的凭据管理器中。
 3. 在悬浮窗选择麦克风和服务，点击“开始”。悬浮窗始终置顶，可用滑块调整透明度；拖动边缘改变大小时字幕自动缩放，Ctrl + 鼠标滚轮可进一步调节字号。
-4. 点击“历史对话”查看按句保存的原文和译文。每次重新打开软件默认是新会话；在历史里选择“继续此会话”后，继续录制时才向旧会话追加。可把选中的会话分别导出为原文和译文两个 TXT 文件。
+4. 点击“历史”查看按句保存的原文和译文。每次重新打开软件默认是新会话；在历史里选择“继续此会话”后，继续录制时才向旧会话追加。可把选中的会话分别导出为原文和译文两个 TXT 文件。
 
 DeepSeek 语音识别需要完整音频片段，短句结束后才出现翻译。腾讯云模式使用实时音频流。两种模式都需要网络，服务商按其计费规则收费。
 
@@ -17,14 +17,14 @@ DeepSeek 语音识别需要完整音频片段，短句结束后才出现翻译�
 
 ```powershell
 python -m pip install -r requirements.txt
-python interpreter.py
+python ctk_app.py
 ```
 
 ## 打包
 
 ```powershell
 python -m pip install pyinstaller
-python -m PyInstaller --onefile --windowed --icon icon.ico --add-data "icon.ico;." --name ZhEnInterpreter --collect-all sounddevice --collect-all keyring interpreter.py
+python -m PyInstaller --onefile --windowed --icon icon.ico --add-data "icon.ico;." --add-data "icon.png;." --name ZhEnInterpreter --collect-all sounddevice --collect-all keyring --collect-all customtkinter ctk_app.py
 ```
 
 生成文件位于 `dist/ZhEnInterpreter.exe`。
