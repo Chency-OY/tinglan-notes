@@ -14,7 +14,7 @@ from pathlib import Path
 import customtkinter as ctk
 import keyring
 import sounddevice as sd
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from interpreter import FRAME_SAMPLES, SAMPLE_RATE, SERVICE, HistoryStore, Interpreter as AudioBackend, clock_text, safe_filename
 from routes import KEYS, priority_loop, priority_order
@@ -76,7 +76,7 @@ def label(parent, text, size=12, color=INK, bold=False, **kwargs):
 
 def button(parent, text, command, width=32, *, symbol=False, fill="transparent", anchor="center"):
     return ctk.CTkButton(parent, text=text, command=command, width=width, height=32,
-                         fg_color=fill, hover_color=SELECT, text_color=SUB, corner_radius=12,
+                         fg_color=fill, hover_color=SELECT, text_color=SUB, corner_radius=8,
                          anchor=anchor, font=font(16 if symbol else 12, family="Segoe MDL2 Assets" if symbol else FONT))
 
 
@@ -118,23 +118,30 @@ def sidebar_icon():
     return ctk.CTkImage(im, size=(22, 22))
 
 
-def history_action_icons():
-    stroke = "#858990"
-    edit = Image.new("RGBA", (88, 88))
-    pen = ImageDraw.Draw(edit)
-    pen.rounded_rectangle((9, 17, 70, 77), radius=13, outline=stroke, width=5)
-    pen.rectangle((36, 7, 78, 46), fill=(0, 0, 0, 0))
-    pen.line([(30, 55), (33, 43), (61, 15), (66, 13), (71, 17),
-              (72, 22), (43, 52), (30, 55)], fill=stroke, width=5, joint="curve")
-    trash = Image.new("RGBA", (88, 88))
-    pen = ImageDraw.Draw(trash)
-    pen.rounded_rectangle((33, 13, 55, 25), radius=5, outline=stroke, width=5)
-    pen.line((14, 25, 74, 25), fill=stroke, width=5)
-    pen.line([(22, 26), (26, 70), (30, 75), (58, 75), (62, 70), (66, 26)],
-             fill=stroke, width=5, joint="curve")
-    for x in (37, 51):
-        pen.line((x, 36, x, 62), fill=stroke, width=4)
-    return [ctk.CTkImage(im, size=(19, 19)) for im in (edit, trash)]
+def sidebar_glyph(glyph):
+    image = Image.new("RGBA", (64, 64))
+    pen = ImageDraw.Draw(image)
+    try:
+        face = ImageFont.truetype("segmdl2.ttf", 48)
+        bounds = face.getbbox(glyph)
+        pen.text(((64 - bounds[2] - bounds[0]) / 2, (64 - bounds[3] - bounds[1]) / 2),
+                 glyph, font=face, fill=SUB)
+    except OSError:
+        pen.rounded_rectangle((12, 12, 52, 52), radius=10, outline=SUB, width=4)
+    return ctk.CTkImage(image, size=(16, 16))
+
+
+def project_icon(opened=False):
+    image = Image.new("RGBA", (64, 64))
+    pen = ImageDraw.Draw(image)
+    pen.line([(8, 49), (8, 19), (12, 15), (25, 15), (31, 21), (52, 21),
+              (56, 25), (56, 49), (52, 53), (12, 53), (8, 49)],
+             fill=SUB, width=4, joint="curve")
+    if opened:
+        pen.polygon([(9, 51), (17, 33), (60, 33), (54, 51), (50, 54), (12, 54)], fill=SIDE)
+        pen.line([(9, 51), (17, 33), (60, 33), (54, 51), (50, 54), (12, 54), (9, 51)],
+                 fill=SUB, width=4, joint="curve")
+    return ctk.CTkImage(image, size=(17, 17))
 
 
 class RecordOrb(tk.Canvas):
@@ -246,14 +253,16 @@ class InterpreterWindow(ctk.CTk):
         self.session_id = self.view_id = None
         self.recording = self.closing = False
         self.panel = None
-        self.library_view = "recent"
-        self.library_project = self.draft_project = None
-        self.organizing = None
-        self.project_form_open = False
+        self.expanded_projects = set()
+        self.archive_open = False
+        self.recent_open = True
+        self.history_action = None
+        self.project_form = None
         self.project_name = ctk.StringVar(value="")
+        self.draft_project = None
+        self.settings_page = self.export_page = None
         self.export_results = queue.Queue()
         self.exporting_project = False
-        self.before_settings = None
         self.desktop_folder = desktop_folder()
         self.export_folder = ctk.StringVar(value=str(self.desktop_folder))
         self.zoom = 1.
@@ -261,7 +270,6 @@ class InterpreterWindow(ctk.CTk):
         self.current_run = None
         self.pending_runs = []
         self.partial = ("", "")
-        self.titled_sessions = set()
         self.devices = {f"{i} · {d['name']}": i for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0}
         self.device = ctk.StringVar(value=next(iter(self.devices), "无可用麦克风"))
         saved_mode = self.history_store.preference("translation_cadence", "")
@@ -270,10 +278,12 @@ class InterpreterWindow(ctk.CTk):
         portrait = Image.open(ASSETS / "icon.png").convert("RGBA")
         self.orbs = [orb_image(portrait, active) for active in (False, True)]
         self.wave = wave_image()
-        self.edit_icon, self.delete_icon = history_action_icons()
+        self.folder_icons = (project_icon(), project_icon(opened=True))
+        self.sidebar_font = font(12)
+        self.sidebar_icons = {glyph: sidebar_glyph(glyph) for glyph in ("\ue70f", "\ue713", "\ue7b8")}
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
-        self.side = ctk.CTkFrame(self, width=204, corner_radius=0, fg_color=SIDE)
+        self.side = ctk.CTkFrame(self, width=224, corner_radius=0, fg_color=SIDE)
         self.side.pack_propagate(False)
         self.main = ctk.CTkFrame(self, corner_radius=0, fg_color=PAPER)
         self.main.grid(row=0, column=1, sticky="nsew")
@@ -284,7 +294,8 @@ class InterpreterWindow(ctk.CTk):
         self._build_dock()
         self._select(None)
         self.bind("<Control-MouseWheel>", self._zoom)
-        self.bind("<Escape>", lambda _: self.set_panel(None))
+        self.set_panel("history")
+        self.bind("<Escape>", self._escape)
         self.bind("<Control-b>", lambda _: self.toggle_history())
         self.after_idle(self.update_overlay)
         self.after(80, self.poll)
@@ -295,7 +306,7 @@ class InterpreterWindow(ctk.CTk):
         self.history_toggle = button(bar, "", self.toggle_history, 34)
         self.history_toggle.configure(image=sidebar_icon(), corner_radius=7)
         self.history_toggle.pack(side="left", padx=(0, 10))
-        title_box = ctk.CTkFrame(bar, fg_color="transparent")
+        title_box = self.title_box = ctk.CTkFrame(bar, fg_color="transparent")
         title_box.pack(side="left", fill="x", expand=True)
         self.heading = label(title_box, "", 16, bold=True, anchor="w")
         self.heading.pack(fill="x")
@@ -305,9 +316,9 @@ class InterpreterWindow(ctk.CTk):
         self.title_entry.bind("<Escape>", lambda _: self.cancel_title())
         self.meta = label(title_box, "", 10, MUTED, anchor="w")
         self.meta.pack(fill="x")
-        self.settings_btn = button(bar, "设置", self.toggle_settings, 44)
+        self.settings_btn = button(bar, "\ue713", self.toggle_settings, 32, symbol=True)
         self.settings_btn.pack(side="right")
-        self.export_btn = button(bar, "导出", lambda: self.set_panel(None if self.panel == "export" else "export"), 44)
+        self.export_btn = button(bar, "导出", self.toggle_export, 44)
         self.export_btn.pack(side="right")
         self.new_btn = button(bar, "\ue710", self.new_session, symbol=True)
         self.new_btn.pack(side="right")
@@ -421,160 +432,340 @@ class InterpreterWindow(ctk.CTk):
         win.deiconify()
 
     def toggle_settings(self):
-        if self.panel == "settings":
-            self.set_panel(self.before_settings)
+        if self.settings_page is not None:
+            self.close_settings()
+            return
+        self.close_export()
+        if self.history_action or self.project_form:
+            self._dismiss_history_action()
+        self.settings_page = ctk.CTkFrame(self.main, corner_radius=0, fg_color=PAPER)
+        self.settings_page.grid(row=0, column=0, rowspan=2, sticky="nsew")
+        self.settings_page.lift()
+        self._settings(self.settings_page)
+
+    def close_settings(self):
+        if self.settings_page is not None:
+            self.settings_page.destroy()
+            self.settings_page = self.settings_tab = None
+
+    def _escape(self, _event):
+        if self.project_form or self.history_action:
+            self._dismiss_history_action()
+        elif self.settings_page is not None:
+            self.close_settings()
+        elif self.export_page is not None:
+            self.close_export()
         else:
-            self.before_settings = self.panel
-            self.set_panel("settings")
+            self.set_panel(None)
+        return "break"
+
+    def toggle_export(self):
+        if self.export_page is not None:
+            self.close_export()
+        elif self.view_id is not None:
+            self.close_settings()
+            page = self.export_page = ctk.CTkFrame(self.main, corner_radius=0, fg_color=PAPER)
+            page.grid(row=0, column=0, rowspan=2, sticky="nsew")
+            page.lift()
+            header = ctk.CTkFrame(page, fg_color="transparent")
+            header.pack(fill="x", padx=18, pady=(9, 4))
+            self._page_heading(header, "导出会话", self.close_export)
+            label(page, "保存位置", 12, bold=True).pack(anchor="w", padx=24, pady=(8, 4))
+            field = ctk.CTkFrame(page, fg_color="transparent")
+            field.pack(fill="x", padx=24)
+            button(field, "浏览…", self.choose_export_folder, 58).pack(side="right", padx=(5, 0))
+            entry = ctk.CTkEntry(field, textvariable=self.export_folder, border_width=1,
+                                 border_color=BORDER, fg_color="white", text_color=INK)
+            entry.pack(side="left", fill="x", expand=True)
+            label(page, "原文和译文各保存一个 TXT，保留每段时间。", 11, MUTED).pack(anchor="w", padx=24, pady=8)
+            button(page, "保存 TXT", self.export, 76, fill=SELECT).pack(anchor="w", padx=24)
+
+    def close_export(self):
+        if self.export_page is not None:
+            self.export_page.destroy()
+            self.export_page = None
+
+    def choose_export_folder(self):
+        folder = Path(self.export_folder.get().strip()).expanduser()
+        path = filedialog.askdirectory(parent=self, title="选择保存位置",
+                                       initialdir=str(folder if folder.is_absolute() and folder.is_dir() else self.desktop_folder))
+        if path:
+            self.export_folder.set(path)
+
+    def _page_heading(self, parent, title, back):
+        button(parent, "\ue72b", back, 28, symbol=True).pack(side="left")
+        label(parent, title, 17, bold=True).pack(side="left", padx=7)
 
     def set_panel(self, name):
         self.panel = name
-        self.project_form_open = False
+        self.history_action = self.project_form = None
         for child in self.side.winfo_children():
             child.destroy()
-        self.history_toggle.configure(fg_color=SELECT if name == "history" else "transparent")
-        self.settings_btn.configure(fg_color=SELECT if name == "settings" else "transparent")
         if name is None:
+            self.history_toggle.pack(side="left", before=self.title_box, padx=(0, 10))
             self.side.grid_remove()
             return
+        self.history_toggle.pack_forget()
         self.side.grid(row=0, column=0, sticky="ns")
         row = ctk.CTkFrame(self.side, fg_color="transparent")
-        row.pack(fill="x", padx=(17, 9), pady=(12, 6))
-        label(row, {"history": "历史对话", "settings": "录制设置", "export": "导出对话"}[name], 15, bold=True).pack(side="left")
-        button(row, "\ue76b", self.toggle_settings if name == "settings" else lambda: self.set_panel(None), symbol=True).pack(side="right")
-        if name == "settings":
-            self._settings()
-        elif name == "export":
-            label(self.side, "保存位置", 12, SUB).pack(anchor="w", padx=16, pady=(18, 6))
-            entry = ctk.CTkEntry(self.side, textvariable=self.export_folder, border_color=BORDER,
-                                 border_width=1, fg_color="white", text_color=INK)
-            entry.pack(fill="x", padx=12)
-            label(self.side, "原文、译文分别保存为 TXT，\n包含会话和每段字幕的时间。", 11, MUTED,
-                  justify="left").pack(anchor="w", padx=16, pady=12)
-            button(self.side, "保存两个文件", self.export, fill=SELECT).pack(fill="x", padx=12)
-        else:
-            button(self.side, "＋   新会话", self.new_session, fill="#E1E9F9", anchor="w").pack(fill="x", padx=12, pady=(6, 9))
-            self.listing = ctk.CTkScrollableFrame(self.side, fg_color="transparent", scrollbar_button_color=BORDER)
-            self.listing.pack(fill="both", expand=True, padx=(8, 2), pady=(0, 8))
-            self._history_list()
+        row.pack(fill="x", padx=(15, 9), pady=(10, 4))
+        label(row, "中英同传", 14, bold=True).pack(side="left")
+        close = button(row, "", lambda: self.set_panel(None), 28)
+        close.configure(image=sidebar_icon())
+        close.pack(side="right")
+        self._sidebar_button(self.side, "新会话", self.new_session, icon="\ue70f").pack(fill="x", padx=10)
+        footer = ctk.CTkFrame(self.side, fg_color="transparent")
+        footer.pack(side="bottom", fill="x", padx=10, pady=(1, 6))
+        self._sidebar_button(footer, "设置", self.toggle_settings, icon="\ue713").pack(side="left")
+        self._sidebar_button(footer, "已归档", self._toggle_archive, icon="\ue7b8").pack(side="right")
+        self.listing = ctk.CTkScrollableFrame(self.side, fg_color="transparent", scrollbar_button_color=BORDER)
+        self.listing.pack(fill="both", expand=True, padx=(9, 3), pady=(3, 0))
+        self._history_list()
+
+    def _sidebar_button(self, parent, title, command, icon=None, selected=False):
+        control = button(parent, title, command, 28, anchor="w", fill=SELECT if selected else "transparent")
+        control.configure(text_color=INK, height=29, border_spacing=5, font=self.sidebar_font)
+        if isinstance(icon, str):
+            control.configure(image=self.sidebar_icons[icon])
+        elif icon is not None:
+            control.configure(image=icon)
+        return control
+
+    def _shorten_title(self, text, width):
+        text = " ".join(text.split())
+        if self.sidebar_font.measure(text) <= width:
+            return text
+        left, right = 0, len(text)
+        while left < right:
+            middle = (left + right + 1) // 2
+            if self.sidebar_font.measure(text[:middle] + "…") <= width:
+                left = middle
+            else:
+                right = middle - 1
+        return text[:left] + "…"
 
     def _history_list(self):
-        if self.panel != "history" or self.project_form_open:
+        if self.panel != "history":
             return
+        canvas = self.listing._parent_canvas
+        position = canvas.yview()[0]
         for child in self.listing.winfo_children():
             child.destroy()
-        def nav(text, command):
-            return button(self.listing, text, command, anchor="w").pack(fill="x", pady=1)
-
-        view = self.library_view
+        self.history_rows = {}
         projects = dict(self.history_store.projects())
-        if self.organizing is not None:
-            sid = self.organizing
-            nav("‹   返回会话列表", lambda: self._browse(view, self.library_project))
-            label(self.listing, self.history_store.title(sid)[:18], 12, bold=True).pack(anchor="w", padx=6, pady=6)
-            restore = view == "archive"
-            nav("恢复到会话列表" if restore else "归档会话", lambda: self._archive(sid, not restore))
-            label(self.listing, "移入项目", 11, MUTED).pack(anchor="w", padx=6, pady=(8, 2))
-            for pid, name in projects.items():
-                nav(name, lambda n=pid: self._move(sid, n))
-            nav("＋   新建项目并移入", lambda: self._create_project_form(sid))
-            nav("移出项目", lambda: self._move(sid, None))
-            return
-        if view == "recent":
-            nav("项目   ›", lambda: self._browse("projects"))
-            nav("已归档   ›", lambda: self._browse("archive"))
-        elif view == "projects":
-            nav("‹   最近会话", lambda: self._browse("recent"))
-            nav("＋   创建项目", self._create_project_form)
-            for pid, name in projects.items():
-                nav(name, lambda n=pid: self._browse("project", n))
-            return
-        elif view == "project":
-            nav("‹   所有项目", lambda: self._browse("projects"))
-            label(self.listing, projects.get(self.library_project, "项目"), 13, bold=True,
-                  wraplength=150, justify="left").pack(anchor="w", padx=6, pady=4)
-            nav("导出项目 ZIP", self._export_project)
-        else:
-            nav("‹   最近会话", lambda: self._browse("recent"))
-            label(self.listing, "已归档", 13, bold=True).pack(anchor="w", padx=6, pady=4)
-        group = None
-        rows = self.history_store.session_previews(self.library_project, view == "archive")
-        if not rows:
-            label(self.listing, {"recent":"还没有会话", "project":"这里还没有未归档的会话", "archive":"还没有归档的会话"}[view],
-                  11, MUTED).pack(anchor="w", padx=6, pady=6)
-        for sid, started, title in rows:
-            date = datetime.fromtimestamp(started)
-            day = "今天" if date.date() == datetime.now().date() else date.strftime("%Y/%m/%d")
-            if day != group:
-                label(self.listing, day, 11, MUTED).pack(anchor="w", padx=8, pady=(12, 4))
-                group = day
-            card = ctk.CTkFrame(self.listing, fg_color=SELECT if sid == self.view_id else "transparent", corner_radius=10)
-            card.pack(fill="x", pady=2)
-            text = title or date.strftime("%m.%d %H:%M")
-            more = button(card, "⋯", lambda n=sid: self._organize(n), 22)
-            more.configure(border_spacing=0)
-            more.pack(side="right")
-            for icon, command in (
-                (self.delete_icon, lambda s=sid, c=card: self.confirm_delete(s, c)),
-                (self.edit_icon, lambda s=sid: self.rename_from_history(s)),
-            ):
-                action = button(card, "", command, 26)
-                action.configure(image=icon, corner_radius=5, border_spacing=0)
-                action.pack(side="right", padx=1)
-            button(card, text, lambda s=sid: self.select_session(s), width=36, anchor="w").pack(side="left", fill="x", expand=True)
+        recent, archived, project_sessions = [], [], {}
+        for sid, started, title, pid, is_archived in self.history_store.library_sessions():
+            item = sid, title or datetime.fromtimestamp(started).strftime("%m.%d %H:%M"), pid
+            if is_archived:
+                archived.append(item)
+            elif pid is None:
+                recent.append(item)
+            else:
+                project_sessions.setdefault(pid, []).append(item)
 
-    def _browse(self, view, pid=None):
-        self.project_form_open = False
-        self.library_view, self.library_project, self.organizing = view, pid, None
-        self._history_list()
-        self.listing._parent_canvas.yview_moveto(0)
+        heading = ctk.CTkFrame(self.listing, fg_color="transparent")
+        heading.pack(fill="x", pady=(3, 0))
+        label(heading, "项目", 11, MUTED, bold=True).pack(side="left", padx=7)
+        button(heading, "创建项目", lambda: self._open_project_form(None), 60).pack(side="right")
+        if self.project_form == ("new", None):
+            self._draw_project_form(self.listing, None)
+        for pid, name in projects.items():
+            opened = pid in self.expanded_projects
+            key = ("project", pid)
+            self._history_row(key, name, lambda n=pid: self._toggle_project(n), icon=self.folder_icons[opened],
+                              selected=self.view_id is None and self.draft_project == pid)
+            if self.history_action == (key, "menu"):
+                self._history_menu([
+                    ("在此新建会话", lambda n=pid: self.new_session(n)),
+                    ("导出项目 ZIP", lambda n=pid: self._export_project(n)),
+                ])
+            if opened:
+                for sid, title, _ in project_sessions.get(pid, ()):
+                    self._session_row(sid, title, pid, projects, indent=18)
+                if pid not in project_sessions:
+                    label(self.listing, "暂无会话", 11, MUTED).pack(anchor="w", padx=24, pady=3)
 
-    def _organize(self, sid):
-        self.organizing = sid
+        if self.archive_open:
+            archive_header = self._sidebar_button(self.listing, "⌄  已归档", self._toggle_archive)
+            archive_header.pack(fill="x", pady=(8, 0))
+            self.history_rows["archive"] = archive_header
+            for sid, title, pid in archived:
+                self._session_row(sid, title, pid, projects, indent=12, archived=True)
+            if not archived:
+                label(self.listing, "暂无归档", 11, MUTED).pack(anchor="w", padx=16, pady=3)
+
+        self._sidebar_button(self.listing, ("⌄" if self.recent_open else "›") + "  最近会话",
+                             self._toggle_recent).pack(fill="x", pady=(8, 0))
+        if self.recent_open:
+            for sid, title, _ in recent:
+                self._session_row(sid, title, None, projects)
+            if not recent:
+                label(self.listing, "暂无会话", 11, MUTED).pack(anchor="w", padx=10, pady=3)
+        self.listing.update_idletasks()
+        canvas.yview_moveto(position)
+
+    def _history_row(self, key, title, command, *, icon=None, selected=False, indent=0):
+        card = ctk.CTkFrame(self.listing, fg_color=SELECT if selected else "transparent", corner_radius=8)
+        card.pack(fill="x", padx=(indent, 0), pady=1)
+        self.history_rows[key] = card
+        more = button(card, "⋯", lambda: self._show_history_action(key, "menu"), 25)
+        more.configure(height=28, border_spacing=0, text_color=SUB if selected or
+                       (self.history_action and self.history_action[0] == key) else SIDE)
+        if not selected and not (self.history_action and self.history_action[0] == key):
+            def hide(_event):
+                x, y = card.winfo_pointerxy()
+                left, top = card.winfo_rootx(), card.winfo_rooty()
+                if not (left <= x < left + card.winfo_width() and top <= y < top + card.winfo_height()):
+                    more.configure(text_color=SIDE)
+
+            card.bind("<Enter>", lambda _: more.configure(text_color=SUB), add="+")
+            card.bind("<Leave>", hide, add="+")
+            more.bind("<Enter>", lambda _: more.configure(text_color=SUB), add="+")
+            more.bind("<Leave>", hide, add="+")
+        more.pack(side="right", padx=(0, 2))
+        short = self._shorten_title(title, 135 - indent - (16 if icon else 0))
+        toggle = self._sidebar_button(card, short, command, icon, selected)
+        toggle.pack(side="left", fill="x", expand=True)
+        if not selected and not (self.history_action and self.history_action[0] == key):
+            toggle.bind("<Enter>", lambda _: more.configure(text_color=SUB), add="+")
+            toggle.bind("<Leave>", hide, add="+")
+
+    def _session_row(self, sid, title, project, projects, *, indent=0, archived=False):
+        key = ("session", sid)
+        self._history_row(key, title, lambda: self.select_session(sid), selected=sid == self.view_id, indent=indent)
+        if self.project_form == ("new", sid):
+            self._draw_project_form(self.listing, sid)
+        if self.history_action == (key, "menu"):
+            self._history_menu([
+                ("重命名", lambda: self.rename_from_history(sid)),
+                ("移入项目  ›", lambda: self._show_history_action(key, "projects")),
+                ("导出 TXT", lambda: self._export_session(sid)),
+                ("恢复会话" if archived else "归档", lambda: self._archive(sid, not archived)),
+                ("删除", lambda: self.confirm_delete(sid)),
+            ])
+        elif self.history_action == (key, "projects"):
+            actions = [(self._shorten_title(name, 130), lambda n=pid: self._move(sid, n))
+                       for pid, name in projects.items() if pid != project]
+            actions.append(("创建项目并移入", lambda: self._open_project_form(sid)))
+            if project is not None:
+                actions.append(("移出当前项目", lambda: self._move(sid, None)))
+            actions.append(("‹  返回", lambda: self._show_history_action(key, "menu")))
+            self._history_menu(actions)
+        elif self.history_action == (key, "delete"):
+            self._history_menu([("确认删除", lambda: self.delete_session(sid)), ("取消", self._dismiss_history_action)])
+
+    def _history_menu(self, actions):
+        menu = ctk.CTkFrame(self.listing, fg_color=PAPER, border_width=1, border_color=BORDER, corner_radius=8)
+        menu.pack(fill="x", padx=(12, 4), pady=(0, 3))
+        label_color = {"删除": "#A24460", "确认删除": "#A24460"}
+        for text, command in actions:
+            control = self._sidebar_button(menu, text, command)
+            if text in label_color:
+                control.configure(text_color=label_color[text])
+            control.pack(fill="x", padx=3, pady=1)
+        self._reveal_sidebar_widget(menu)
+
+    def _reveal_sidebar_widget(self, widget):
+        def reveal():
+            if not widget.winfo_exists():
+                return
+            canvas = self.listing._parent_canvas
+            region = canvas.bbox("all")
+            if not region or not canvas.winfo_viewable():
+                return
+            height = canvas.winfo_height()
+            top = widget.winfo_rooty() - canvas.winfo_rooty()
+            if top < 0:
+                shift = top
+            else:
+                shift = min(top, max(0, top + widget.winfo_height() - height))
+            if shift:
+                canvas.yview_moveto((canvas.canvasy(0) + shift) / max(1, region[3]))
+        self.after_idle(reveal)
+
+    def _show_history_action(self, key, action):
+        self.project_form = None
+        state = (key, action)
+        self.history_action = None if self.history_action == state else state
         self._history_list()
-        self.listing._parent_canvas.yview_moveto(0)
+
+    def _dismiss_history_action(self):
+        self.history_action = self.project_form = None
+        self._history_list()
+
+    def _toggle_project(self, pid):
+        self.expanded_projects.symmetric_difference_update({pid})
+        self._dismiss_history_action()
+
+    def _toggle_recent(self):
+        self.recent_open = not self.recent_open
+        self._dismiss_history_action()
+
+    def _toggle_archive(self):
+        self.archive_open = not self.archive_open
+        self._dismiss_history_action()
+        if self.archive_open:
+            self._reveal_sidebar_widget(self.history_rows["archive"])
 
     def _archive(self, sid, archive):
         self.history_store.archive_session(sid, archive)
-        self._browse(self.library_view, self.library_project)
-        self.status.set("已归档 · 可在已归档中恢复" if archive else "已恢复 · 保留原有项目")
+        self._dismiss_history_action()
+        self.status.set("会话已归档" if archive else "会话已恢复")
 
     def _move(self, sid, pid):
         self.history_store.move_session(sid, pid)
-        self._browse(self.library_view, self.library_project)
-        self.status.set("已移入项目" if pid else "已移出项目")
+        if pid is not None:
+            self.expanded_projects.add(pid)
+        else:
+            self.recent_open = True
+        self._dismiss_history_action()
+        target = self.history_rows.get(("session", sid))
+        if target is not None:
+            self._reveal_sidebar_widget(target)
+        self.status.set("已移入项目" if pid is not None else "已移出项目")
 
-    def _create_project_form(self, sid=None):
-        self.project_form_open = True
-        for child in self.listing.winfo_children():
-            child.destroy()
-        label(self.listing, "创建项目", 14, bold=True).pack(anchor="w", padx=6, pady=8)
+    def _open_project_form(self, sid):
         self.project_name.set("")
-        entry = ctk.CTkEntry(self.listing, textvariable=self.project_name, placeholder_text="项目名称", fg_color=PAPER, border_color=BORDER)
-        entry.pack(fill="x", pady=4)
+        self.history_action = None
+        self.project_form = ("new", sid)
+        self._history_list()
+        self.project_entry.focus_set()
+
+    def _draw_project_form(self, parent, sid):
+        form = ctk.CTkFrame(parent, fg_color=PAPER, border_width=1, border_color=BORDER)
+        form.pack(fill="x", padx=3, pady=4)
+        entry = self.project_entry = ctk.CTkEntry(form, textvariable=self.project_name,
+                                                 fg_color="white", border_color=BORDER)
+        label(form, "项目名称", 11, MUTED).pack(anchor="w", padx=8, pady=(5, 0))
+        entry.pack(fill="x", padx=6, pady=4)
+
         def save():
             try:
                 pid = self.history_store.create_project(self.project_name.get())
             except ValueError as exc:
-                self.status.set(str(exc))
+                feedback.configure(text=str(exc))
                 return
             if sid is not None:
-                self.history_store.move_session(sid, pid)
-            self._browse("project", pid)
-            self.status.set("项目已创建" if sid is None else "项目已创建，会话已移入")
-        entry.bind("<Return>", lambda _: save())
-        button(self.listing, "创建并移入" if sid else "创建", save, fill=SELECT).pack(fill="x", pady=4)
-        def cancel():
-            self.project_form_open = False
-            self._history_list()
-        button(self.listing, "取消", cancel).pack(fill="x")
-        entry.focus_set()
+                self._move(sid, pid)
+            else:
+                self.expanded_projects.add(pid)
+                self._dismiss_history_action()
+                self._reveal_sidebar_widget(self.history_rows[("project", pid)])
+                self.status.set("项目已创建")
 
-    def _export_project(self):
+        entry.bind("<Return>", lambda _: save())
+        feedback = label(form, "", 10, "#A24460")
+        feedback.pack(anchor="w", padx=6)
+        controls = ctk.CTkFrame(form, fg_color="transparent")
+        controls.pack(fill="x", padx=4, pady=(0, 4))
+        button(controls, "取消", self._dismiss_history_action, 38).pack(side="right")
+        button(controls, "创建并移入" if sid is not None else "创建", save, 60, fill=SELECT).pack(side="right", padx=3)
+        self._reveal_sidebar_widget(form)
+
+    def _export_project(self, pid):
         if self.exporting_project:
             self.status.set("正在导出项目，请稍候")
             return
-        pid = self.library_project
         if not any(self.history_store.session_previews(pid, archived) for archived in (False, True)):
             self.status.set("项目里还没有会话")
             return
@@ -595,6 +786,10 @@ class InterpreterWindow(ctk.CTk):
                 result = f"导出失败：{exc}"
             self.export_results.put(result)
         threading.Thread(target=write_zip, name="project-export").start()
+
+    def _export_session(self, sid):
+        self.select_session(sid)
+        self.toggle_export()
 
     def rename_from_history(self, sid):
         self.select_session(sid)
@@ -625,83 +820,115 @@ class InterpreterWindow(ctk.CTk):
         self._history_list()
         self.status.set("名称已保存")
 
-    def confirm_delete(self, sid, actions):
+    def confirm_delete(self, sid):
         if any(run.session_id == sid for run in self.pending_runs):
             self.status.set("请等这段录制结束并保存后再删除")
             return
-        for child in actions.winfo_children():
-            child.destroy()
-        button(actions, "确认删除", lambda: self.delete_session(sid), 68, fill="#F3DFE6").pack(side="left")
-        button(actions, "取消", self._history_list, 42).pack(side="left")
+        self._show_history_action(("session", sid), "delete")
 
     def delete_session(self, sid):
         if any(run.session_id == sid for run in self.pending_runs):
             return
         self.history_store.delete_session(sid)
+        self.history_action = None
         if self.session_id == sid:
             self.session_id = None
         if self.view_id == sid:
             self.draft_title = ""
+            self.draft_project = None
+            self.close_export()
             self._select(self.session_id)
         else:
             self._history_list()
         self.status.set("会话已删除")
 
-    def _settings(self):
-        save = button(self.side, "保存设置", self.save_settings, fill=SELECT)
-        save.pack(side="bottom", fill="x", padx=14, pady=10)
-        form = ctk.CTkScrollableFrame(self.side, fg_color="transparent", scrollbar_button_color=BORDER)
-        form.pack(fill="both", expand=True, padx=(8, 2))
-        def caption(text):
-            label(form, text, 11, SUB).pack(anchor="w", padx=4, pady=(12, 4))
+    def _settings(self, page):
+        header = ctk.CTkFrame(page, fg_color="transparent")
+        header.pack(fill="x", padx=18, pady=(9, 4))
+        self._page_heading(header, "设置", self.close_settings)
+        button(header, "保存设置", self.save_settings, 72, fill=SELECT).pack(side="right")
+        tabs = ctk.CTkFrame(page, fg_color="transparent")
+        tabs.pack(fill="x", padx=18, pady=(0, 4))
+        sections = {}
+        for name in ("录制", "翻译服务", "外观"):
+            frame = ctk.CTkScrollableFrame(page, fg_color="transparent", scrollbar_button_color=BORDER)
+            tab = button(tabs, name, lambda n=name: show(n), 64)
+            tab.pack(side="left", padx=(0, 3))
+            sections[name] = (tab, frame)
+
+        def show(name):
+            for key, (tab, frame) in sections.items():
+                tab.configure(fg_color=SELECT if key == name else "transparent")
+                if key == name:
+                    frame.pack(fill="both", expand=True, padx=(18, 12), pady=(0, 4))
+                else:
+                    frame.pack_forget()
+
+        def caption(parent, text):
+            label(parent, text, 12, INK, bold=True).pack(anchor="w", padx=3, pady=(5, 3))
+
+        recording = sections["录制"][1]
         self.options = []
-        for name, var, values in (("录制模式", self.mode, ["停顿翻译", "腾讯云 实时"]),
-                                   ("麦克风", self.device, list(self.devices) or ["无可用麦克风"])):
-            caption(name)
-            menu = ctk.CTkOptionMenu(form, variable=var, values=values, width=110, dynamic_resizing=False,
+        for name, var, values in (
+            ("麦克风", self.device, list(self.devices) or ["无可用麦克风"]),
+            ("录制模式", self.mode, ["停顿翻译", "腾讯云 实时"]),
+        ):
+            caption(recording, name)
+            menu = ctk.CTkOptionMenu(recording, variable=var, values=values, width=110, dynamic_resizing=False,
                                      fg_color="white", button_color="#DCE5F6", button_hover_color=SELECT,
                                      text_color=INK, dropdown_fg_color=PAPER, dropdown_text_color=INK,
-                                     state="disabled" if self.recording else "normal", font=font(11))
-            menu.pack(fill="x", padx=2)
+                                     state="disabled" if self.recording else "normal", font=font(12))
+            menu.pack(fill="x", padx=3, pady=(0, 4))
             self.options.append(menu)
-        caption("API 优先级 · 从上到下")
-        order_box = ctk.CTkFrame(form, fg_color="transparent")
-        order_box.pack(fill="x")
+
+        services = sections["翻译服务"][1]
+        caption(services, "API 优先级")
+        order_box = ctk.CTkFrame(services, fg_color=SIDE, corner_radius=8)
+        order_box.pack(fill="x", padx=3)
         self.pending_priority = list(self.priority)
+
         def draw_order():
             for child in order_box.winfo_children():
                 child.destroy()
             for index, name in enumerate(self.pending_priority):
                 row = ctk.CTkFrame(order_box, fg_color="transparent")
-                row.pack(fill="x")
-                label(row, f"{index + 1}  {name}", 11).pack(side="left", padx=3)
+                row.pack(fill="x", padx=9, pady=2)
+                label(row, name, 12).pack(side="left", pady=6)
                 if index:
-                    button(row, "上移", lambda i=index: move(i), 40).pack(side="right")
+                    button(row, "上移", lambda i=index: move(i), 42).pack(side="right")
+
         def move(index):
             order = self.pending_priority
             order[index - 1], order[index] = order[index], order[index - 1]
             draw_order()
+
         draw_order()
-        label(form, "跳过未填密钥的服务。当前服务失败时，本段尝试下一项。", 11, MUTED,
-              wraplength=147, justify="left").pack(anchor="w", pady=5)
-        ctk.CTkCheckBox(form, text="显示桌面悬浮球", variable=self.float_enabled, command=self.update_overlay,
-                        text_color=SUB, font=font(12)).pack(anchor="w", pady=(8, 2))
-        caption("窗口透明度")
-        slider = ctk.CTkSlider(form, from_=.55, to=1., width=100, button_color=ACCENT, progress_color="#A6B9DF",
-                               button_hover_color=SUB, command=self.set_opacity)
-        slider.set(self.opacity)
-        slider.pack(fill="x", padx=6, pady=(4, 8))
+        label(services, "从上到下尝试，跳过没有密钥的服务。", 11, MUTED).pack(anchor="w", padx=3, pady=5)
         self.entries = {}
-        for name, account in (("Kimi Code 订阅 Key", "kimi_key"), ("DeepSeek API Key", "deepseek_key"), ("腾讯云 AppID", "tencent_appid"),
-                              ("腾讯云 SecretId", "tencent_id"), ("腾讯云 SecretKey", "tencent_key")):
-            caption(name)
-            entry = ctk.CTkEntry(form, show="*", border_width=1, border_color=BORDER, fg_color="white", text_color=INK)
-            entry.pack(fill="x", padx=2, pady=(0, 3))
+        for name, account in (
+            ("Kimi Code 订阅 Key", "kimi_key"), ("DeepSeek API Key", "deepseek_key"),
+            ("腾讯云 AppID", "tencent_appid"), ("腾讯云 SecretId", "tencent_id"), ("腾讯云 SecretKey", "tencent_key"),
+        ):
+            caption(services, name)
+            entry = ctk.CTkEntry(services, show="*", border_width=1, border_color=BORDER, fg_color="white", text_color=INK)
+            entry.pack(fill="x", padx=3, pady=(0, 3))
             try:
                 entry.insert(0, keyring.get_password(SERVICE, account) or "")
             except Exception:
                 entry.configure(state="disabled")
             self.entries[account] = entry
+
+        appearance = sections["外观"][1]
+        caption(appearance, "悬浮球")
+        ctk.CTkSwitch(appearance, text="显示桌面悬浮球", variable=self.float_enabled, command=self.update_overlay,
+                      text_color=SUB, font=font(12), progress_color=ACCENT).pack(anchor="w", padx=3, pady=5)
+        caption(appearance, "窗口透明度")
+        slider = ctk.CTkSlider(appearance, from_=.55, to=1., width=150, button_color=ACCENT, progress_color="#A6B9DF",
+                               button_hover_color=SUB, command=self.set_opacity)
+        slider.set(self.opacity)
+        slider.pack(anchor="w", padx=3, pady=(4, 8))
+        self.settings_tab = show
+        show("录制")
 
     def set_opacity(self, value):
         self.opacity = float(value)
@@ -727,10 +954,10 @@ class InterpreterWindow(ctk.CTk):
         self.history_store.set_preference("priority", "|".join(self.priority))
         self.history_store.set_preference("translation_cadence", self.mode.get())
         self.history_store.set_preference("overlay", str(int(self.float_enabled.get())))
-        self.set_panel(self.before_settings)
+        self.close_settings()
         self.status.set("设置已保存")
 
-    def _select(self, sid):
+    def _select(self, sid, *, update_sidebar=True):
         self.cancel_title()
         self.view_id = sid
         self._header_state()
@@ -753,7 +980,8 @@ class InterpreterWindow(ctk.CTk):
                                       "原文与译文将在这里逐段显示" if sid is None else "这段会话还没有已保存的内容")
             self.empty.place(relx=.5, rely=.48, anchor="center")
         self.transcript.yview_moveto(1. if sid == self.session_id else 0.)
-        self._history_list()
+        if update_sidebar:
+            self._history_list()
         self._dock_state()
 
     def _header_state(self):
@@ -796,18 +1024,21 @@ class InterpreterWindow(ctk.CTk):
             box.see("end")
 
     def select_session(self, sid):
+        self.close_settings()
+        self.close_export()
+        self.history_action = self.project_form = None
         self.status.set("")
         self._select(sid)
 
-    def new_session(self):
+    def new_session(self, project_id=None):
         if self.recording:
             self.status.set("请先点击头像暂停当前录制")
             return
         self.session_id = None
-        self.draft_project = self.library_project if self.panel == "history" and self.library_view == "project" else None
+        self.draft_project = project_id
+        if project_id is not None:
+            self.expanded_projects.add(project_id)
         self.draft_title = ""
-        if self.panel == "export":
-            self.set_panel(None)
         self.select_session(None)
 
     def export(self):
@@ -830,6 +1061,7 @@ class InterpreterWindow(ctk.CTk):
         except OSError as exc:
             self.status.set(f"导出失败 · {exc.strerror}")
             return
+        self.close_export()
         self.status.set("已分别导出原文和译文")
 
     def toggle(self):
@@ -848,9 +1080,10 @@ class InterpreterWindow(ctk.CTk):
             self.status.set("无法读取 Windows 凭据，请检查设置")
             return
         if missing or self.device.get() not in self.devices:
-            self.status.set("请在左侧填写当前翻译服务的密钥" if missing else "请在左侧选择可用的麦克风")
-            if self.panel != "settings":
+            self.status.set("请在「翻译服务」填写密钥" if missing else "请选择可用的麦克风")
+            if self.settings_page is None:
                 self.toggle_settings()
+            self.settings_tab("翻译服务" if missing else "录制")
             return
         run = RecordingRun(self.history_store, keys, routes)
         try:
@@ -879,7 +1112,7 @@ class InterpreterWindow(ctk.CTk):
         self.status.set("正在收音" if realtime else "正在收音 · 停顿 1 秒后翻译")
         self._select(sid)
         self.update_overlay()
-        if self.panel == "settings":
+        if self.settings_page is not None:
             for menu in self.options:
                 menu.configure(state="disabled")
         backend = AudioBackend.tencent_loop if realtime else priority_loop
@@ -901,7 +1134,7 @@ class InterpreterWindow(ctk.CTk):
                 self.empty_title.configure(text="已暂停收音")
                 self.empty_hint.configure(text="收到的译文会保存在本次会话")
             self.status.set("已暂停收音 · 剩余译文在后台保存")
-            if self.panel == "settings":
+            if self.settings_page is not None:
                 for menu in self.options:
                     menu.configure(state="normal")
 
@@ -929,9 +1162,6 @@ class InterpreterWindow(ctk.CTk):
                 self.history_store.append(sid, start, end, src, dst)
             if self.view_id == sid:
                 self._write_segment(start, end, src, dst, final=final)
-            if final and self.panel == "history" and sid not in self.titled_sessions:
-                self.titled_sessions.add(sid)
-                self._history_list()
         elif e[0] == "status":
             if any(word in e[1] for word in ("失败", "中断", "错误", "overflow")):
                 run.failure = e[1]
@@ -945,7 +1175,7 @@ class InterpreterWindow(ctk.CTk):
             run.saved.set()  # Previous translations have reached SQLite before continuation.
             if not self.recording and self.view_id == sid:
                 self.partial = ("", "")
-                self._select(sid)
+                self._select(sid, update_sidebar=False)
                 self.status.set(run.failure or ("已暂停收音 · 剩余译文在后台保存" if self.pending_runs else "已暂停 · 已保存"))
 
     def poll(self):

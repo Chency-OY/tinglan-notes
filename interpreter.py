@@ -129,6 +129,12 @@ class HistoryStore:
                 AND (? IS NULL OR project_id=?) ORDER BY started DESC,id DESC""",
                 (int(archived), project_id, project_id)).fetchall()
 
+    def library_sessions(self):
+        with self.connect() as db:
+            return db.execute("""
+                SELECT id,started,title,project_id,archived FROM sessions ORDER BY started DESC,id DESC
+            """).fetchall()
+
     def projects(self):
         with self.connect() as db:
             return db.execute("SELECT id,name FROM projects ORDER BY name COLLATE NOCASE,id").fetchall()
