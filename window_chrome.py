@@ -63,6 +63,10 @@ class WindowsTitleStrip(tk.Canvas):
     BACKGROUND = "#F1F4FA"
     INK = "#44516A"
     HOVER = "#E3EBF8"
+    RESIZE_EDGES = (
+        ("n", "size_ns"), ("s", "size_ns"), ("w", "size_we"), ("e", "size_we"),
+        ("nw", "size_nw_se"), ("ne", "size_ne_sw"), ("sw", "size_ne_sw"), ("se", "size_nw_se"),
+    )
 
     @classmethod
     def install(cls, window, scale):
@@ -77,13 +81,16 @@ class WindowsTitleStrip(tk.Canvas):
 
     def __init__(self, window, scale):
         self.scale = scale
-        self.bar_height = round(36 * scale)
+        self.bar_height = round(38 * scale)
         self.control_width = round(44 * scale)
-        self.resize_border = max(5, round(5 * scale))
+        self.resize_border = max(7, round(7 * scale))
+        self.resize_grip = round(15 * scale)
+        self.resize_handles = {}
+        self.edge_drag = None
+        self.edges_visible = False
         super().__init__(window, height=self.bar_height, background=self.BACKGROUND, highlightthickness=0, borderwidth=0)
-        families = {name.casefold() for name in tkfont.families(window)}
-        family = "DengXian" if "dengxian" in families else "等线" if "等线" in families else "Microsoft YaHei UI"
-        self.caption_font = tkfont.Font(root=window, family=family, size=-round(15 * scale))
+        self.caption_font = tkfont.Font(root=window, family="Microsoft YaHei UI",
+                                        size=-round(15 * scale), weight="bold")
         self.hovered = None
         self.pressed = self.drag_origin = None
         self.hwnd = None
@@ -107,12 +114,8 @@ class WindowsTitleStrip(tk.Canvas):
         proc = ctypes.WINFUNCTYPE(result, wintypes.HWND, wintypes.UINT, pointer, signed, pointer, pointer)
         self.callback = proc(self._dispatch)
         self.subclass_id = id(self)
-        user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
-        user32.GetClientRect.restype = wintypes.BOOL
         user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
         user32.GetWindowRect.restype = wintypes.BOOL
-        user32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
-        user32.ScreenToClient.restype = wintypes.BOOL
         user32.IsZoomed.argtypes = [wintypes.HWND]
         user32.IsZoomed.restype = wintypes.BOOL
         user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
@@ -148,10 +151,6 @@ class WindowsTitleStrip(tk.Canvas):
             if self.user32.IsZoomed(hwnd):
                 self._limit_maximized_client(lparam)
             return 0
-        if message == 0x0084:  # WM_NCHITTEST
-            result = self._hit_test(hwnd, lparam)
-            if result is not None:
-                return result
         if message == 0x0082:  # WM_NCDESTROY
             self.comctl.RemoveWindowSubclass(hwnd, self.callback, self.subclass_id)
             self.hwnd = None
@@ -173,28 +172,91 @@ class WindowsTitleStrip(tk.Canvas):
             bounds.right = min(bounds.right, info.work.right)
             bounds.bottom = min(bounds.bottom, info.work.bottom)
 
-    def _hit_test(self, hwnd, position):
-        x = ctypes.c_short(position & 0xFFFF).value
-        y = ctypes.c_short((position >> 16) & 0xFFFF).value
-        point = wintypes.POINT(x, y)
-        client = wintypes.RECT()
-        if not self.user32.ScreenToClient(hwnd, ctypes.byref(point)) or not self.user32.GetClientRect(hwnd, ctypes.byref(client)):
-            return None
-        if not (0 <= point.x < client.right and 0 <= point.y < client.bottom):
-            return None
-        if not self.user32.IsZoomed(hwnd):
-            border = self.resize_border
-            left = point.x < border
-            right = point.x >= client.right - border
-            top = point.y < border
-            bottom = point.y >= client.bottom - border
-            if top:
-                return 13 if left else 14 if right else 12
-            if bottom:
-                return 16 if left else 17 if right else 15
-            if left or right:
-                return 10 if left else 11
-        return 1  # The title strip handles pointer input in the Tk client area.
+    def install_resize_handles(self, surface_color, sidebar_color):
+        self.surface_color = surface_color
+        self.sidebar_color = sidebar_color
+        for edge, cursor in self.RESIZE_EDGES:
+            color = self.BACKGROUND if "n" in edge else surface_color
+            handle = tk.Canvas(self.master, bg=color, bd=0, highlightthickness=0, cursor=cursor, takefocus=False)
+            handle.bind("<ButtonPress-1>", lambda event, side=edge: self._start_resize(event, side))
+            handle.bind("<B1-Motion>", self._resize_window)
+            handle.bind("<ButtonRelease-1>", self._finish_resize)
+            self.resize_handles[edge] = handle
+        self.resize_handles["se"].bind("<Configure>", self._draw_resize_grip)
+        self.master.bind("<Configure>", self._sync_resize_handles, add="+")
+        self._sync_resize_handles()
+
+    def set_sidebar_visible(self, visible):
+        if self.resize_handles:
+            color = self.sidebar_color if visible else self.surface_color
+            for edge in ("w", "sw"):
+                self.resize_handles[edge].configure(bg=color)
+
+    def _sync_resize_handles(self, event=None):
+        if (event is not None and event.widget is not self.master) or not self.hwnd:
+            return
+        visible = not self.user32.IsZoomed(self.hwnd)
+        if visible == self.edges_visible:
+            return
+        self.edges_visible = visible
+        if not visible:
+            for handle in self.resize_handles.values():
+                handle.place_forget()
+            return
+        band, grip = self.resize_border, self.resize_grip
+        positions = {
+            "n": dict(x=band, y=0, relwidth=1, width=-2 * band, height=band),
+            "s": dict(x=band, rely=1, anchor="sw", relwidth=1, width=-band - grip, height=band),
+            "w": dict(x=0, y=band, relheight=1, height=-2 * band, width=band),
+            "e": dict(relx=1, y=band, anchor="ne", relheight=1, height=-band - grip, width=band),
+            "nw": dict(width=band, height=band),
+            "ne": dict(relx=1, anchor="ne", width=band, height=band),
+            "sw": dict(rely=1, anchor="sw", width=band, height=band),
+            "se": dict(relx=1, rely=1, anchor="se", width=grip, height=grip),
+        }
+        for edge, handle in self.resize_handles.items():
+            handle.place(**positions[edge])
+            handle.tk.call("raise", handle._w)
+
+    def _draw_resize_grip(self, event):
+        grip = event.widget
+        grip.delete("all")
+        end = event.width - max(3, round(3 * self.scale))
+        for size in (3, 6):
+            reach = round(size * self.scale)
+            grip.create_line(end - reach, end, end, end - reach, fill="#8396BB", width=max(1, round(self.scale)))
+
+    def _start_resize(self, event, edge):
+        if not self.hwnd or self.user32.IsZoomed(self.hwnd):
+            return
+        bounds = wintypes.RECT()
+        if self.user32.GetWindowRect(self.hwnd, ctypes.byref(bounds)):
+            self.edge_drag = edge, event.x_root, event.y_root, bounds
+            event.widget.grab_set()
+
+    def _resize_window(self, event):
+        if self.edge_drag is None or not self.hwnd or self.user32.IsZoomed(self.hwnd):
+            return
+        edge, start_x, start_y, bounds = self.edge_drag
+        dx, dy = event.x_root - start_x, event.y_root - start_y
+        left, top, right, bottom = bounds.left, bounds.top, bounds.right, bounds.bottom
+        min_width, min_height = map(int, self.master.tk.call("wm", "minsize", self.master._w))
+        if "w" in edge:
+            left = min(right - min_width, left + dx)
+        if "e" in edge:
+            right = max(left + min_width, right + dx)
+        if "n" in edge:
+            top = min(bottom - min_height, top + dy)
+        if "s" in edge:
+            bottom = max(top + min_height, bottom + dy)
+        self.user32.SetWindowPos(self.hwnd, None, left, top, right - left, bottom - top, 0x0014)
+
+    def _finish_resize(self, event):
+        # A desktop can coalesce motion events, so use the release point too.
+        self._resize_window(event)
+        self.edge_drag = None
+        if event.widget.grab_current() is event.widget:
+            event.widget.grab_release()
 
     def _button(self, x):
         index = (self.winfo_width() - 1 - x) // self.control_width
@@ -273,12 +335,16 @@ class WindowsTitleStrip(tk.Canvas):
         width, height = self.winfo_width(), self.winfo_height()
         middle = height / 2
         self.create_line(0, height - 1, width, height - 1, fill="#E3E9F3")
-        self.create_oval(13 * scale, middle - 8 * scale, 29 * scale, middle + 8 * scale, fill="#DDE8FC", outline="")
-        for i, line_height in enumerate((4, 7, 5)):
-            x = (18 + i * 3) * scale
+        self.create_oval(14 * scale, middle - 10 * scale, 34 * scale, middle + 10 * scale,
+                         fill="#DCE8FC", outline="")
+        for i, line_height in enumerate((5, 10, 7)):
+            x = (20 + i * 4) * scale
             self.create_line(x, middle - line_height * scale / 2, x, middle + line_height * scale / 2,
-                             fill="#5876AA", width=max(1, round(scale)), capstyle="round")
-        self.create_text(37 * scale, middle, text="中英同传", font=self.caption_font, fill=self.INK, anchor="w")
+                             fill="#5073B3", width=max(1, round(1.5 * scale)), capstyle="round")
+        x = 43 * scale
+        for character in "中英同传":
+            self.create_text(x, middle, text=character, font=self.caption_font, fill="#293955", anchor="w")
+            x += self.caption_font.measure(character) + max(1, round(self.scale))
 
         maximized = bool(self.hwnd and self.user32.IsZoomed(self.hwnd))
         stroke = max(1, round(scale))

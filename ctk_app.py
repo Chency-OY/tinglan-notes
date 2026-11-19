@@ -418,6 +418,9 @@ class InterpreterWindow(ctk.CTk):
         self._select(None)
         self.bind("<Control-MouseWheel>", self._zoom)
         self.set_panel("history")
+        if self.title_strip is not None:
+            self.title_strip.install_resize_handles(PAPER, SIDE)
+            self.title_strip.set_sidebar_visible(True)
         self.bind("<Escape>", self._escape)
         self.bind("<Button-1>", self._outside_row_menu, add="+")
         self.bind("<MouseWheel>", self._scroll_outside_row_menu, add="+")
@@ -726,6 +729,8 @@ class InterpreterWindow(ctk.CTk):
 
     def set_panel(self, name):
         self.panel = name
+        if self.title_strip is not None:
+            self.title_strip.set_sidebar_visible(name == "history")
         self._close_row_menu()
         self.history_rows.clear()
         self.session_sections.clear()

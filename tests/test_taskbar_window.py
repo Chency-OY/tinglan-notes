@@ -58,7 +58,7 @@ class TaskbarWindowTests(unittest.TestCase):
                 app.destroy()
 
 
-    def test_caption_moves_on_release_and_font_size_stays_visible(self):
+    def test_caption_drag_resize_and_font_size(self):
         user32 = ctypes.WinDLL("user32")
         user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
         with tempfile.TemporaryDirectory() as folder, patch("ctk_app.sd.query_devices", return_value=[]):
@@ -78,6 +78,19 @@ class TaskbarWindowTests(unittest.TestCase):
                 strip.event_generate("<ButtonRelease-1>", x=x+50, y=y+40, rootx=before.left+x+50, rooty=before.top+y+40)
                 self.assertTrue(user32.GetWindowRect(strip.hwnd, ctypes.byref(after)))
                 self.assertEqual((after.left, after.top), (before.left+50, before.top+40))
+                app.update()
+                for edge, delta, size_change in (("e", (60, 0), (60, 0)), ("se", (30, 35), (30, 35))):
+                    handle = strip.resize_handles[edge]
+                    self.assertTrue(handle.winfo_viewable())
+                    self.assertTrue(user32.GetWindowRect(strip.hwnd, ctypes.byref(before)))
+                    x, y = handle.winfo_rootx() + 3, handle.winfo_rooty() + 3
+                    handle.event_generate("<ButtonPress-1>", x=3, y=3, rootx=x, rooty=y)
+                    handle.event_generate("<ButtonRelease-1>", x=3+delta[0], y=3+delta[1],
+                                          rootx=x+delta[0], rooty=y+delta[1])
+                    self.assertTrue(user32.GetWindowRect(strip.hwnd, ctypes.byref(after)))
+                    self.assertEqual((before.left, before.top), (after.left, after.top))
+                    self.assertEqual((after.right-before.right, after.bottom-before.bottom), size_change)
+                    app.update()
                 self.assertTrue(app.size_up.winfo_viewable())
                 self.assertEqual(app.size_readout.get(), "14 pt")
                 app.size_up.invoke()
