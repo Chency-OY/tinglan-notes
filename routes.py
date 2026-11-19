@@ -1,6 +1,7 @@
 """Ordered speech translation routes for interactive microphone sessions."""
 from __future__ import annotations
 
+from collections import deque
 import json
 import queue
 import subprocess
@@ -10,7 +11,7 @@ import time
 from pathlib import Path
 
 import httpx
-import numpy as np
+import webrtcvad
 import websocket
 
 from interpreter import FRAME_SAMPLES, SAMPLE_RATE, tencent_url, wav_bytes
@@ -131,44 +132,54 @@ def translate_segment(client, pcm, routes, keys, notify, previous=None):
     return source, ""
 
 
-def minute_boundary(buffer):
-    """At the minute mark, prefer the end of a quiet 200 ms interval near the boundary."""
-    window = SAMPLE_RATE // 5
-    lookback = 3 * SAMPLE_RATE
-    samples = np.frombuffer(buffer, dtype="<i2", count=lookback, offset=MINUTE_BYTES - 2 * lookback)
-    blocks = samples.astype(np.float32).reshape(-1, window)
-    rms = np.sqrt(np.mean(blocks * blocks, axis=1))
-    threshold = min(120., max(8., np.max(rms) * .12))
-    quiet = np.flatnonzero(rms <= threshold)
-    if quiet.size:
-        return MINUTE_BYTES - (len(rms) - 1 - int(quiet[-1])) * window * 2
-    return MINUTE_BYTES
+VAD_FRAME_BYTES = SAMPLE_RATE * 2 // 50  # WebRTC accepts 20 ms frames.
+PAUSE_BYTES = SAMPLE_RATE * 2
 
 
-def minute_batches(app):
-    # The microphone callback keeps queuing frames while the consumer is contacting a provider.
-    buffer = bytearray()
-    total_bytes = 0
+def vad_frames(app):
+    remainder = b""
     while not app.stop_event.is_set() or not app.audio.empty():
         try:
-            buffer.extend(app.audio.get(timeout=.1))
+            data = remainder + app.audio.get(timeout=.1)
         except queue.Empty:
             continue
-        while len(buffer) >= MINUTE_BYTES:
-            cut = minute_boundary(buffer)
-            pcm = bytes(buffer[:cut])
-            del buffer[:cut]
-            yield pcm, total_bytes
-            total_bytes += cut
-    if buffer:
-        yield bytes(buffer), total_bytes
+        complete = len(data) - len(data) % VAD_FRAME_BYTES
+        for pos in range(0, complete, VAD_FRAME_BYTES):
+            yield data[pos:pos + VAD_FRAME_BYTES]
+        remainder = data[complete:]
+    if remainder:
+        yield remainder
+
+
+def speech_batches(app):
+    detector = webrtcvad.Vad(1)
+    preroll = deque(maxlen=10)  # Keep the onset even when VAD responds a little late.
+    audio = bytearray()
+    offset = quiet_bytes = 0
+    for frame in vad_frames(app):
+        voiced = detector.is_speech(frame.ljust(VAD_FRAME_BYTES, b"\0"), SAMPLE_RATE) and any(frame)
+        offset += len(frame)
+        if not audio and not voiced:
+            preroll.append(frame)
+            continue
+        if not audio:
+            audio.extend(b"".join(preroll))
+            preroll.clear()
+        audio.extend(frame)
+        quiet_bytes = 0 if voiced else quiet_bytes + len(frame)
+        if quiet_bytes >= PAUSE_BYTES or len(audio) >= MINUTE_BYTES:
+            yield bytes(audio), offset - len(audio)
+            audio.clear()
+            quiet_bytes = 0
+    if audio:
+        yield bytes(audio), offset - len(audio)
 
 
 def priority_loop(app):
     sid = app.session_id
     previous = app.history_store.last_translation(sid)
     with httpx.Client(timeout=httpx.Timeout(90., connect=8.)) as client:
-        for pcm, offset in minute_batches(app):
+        for pcm, offset in speech_batches(app):
             if not any(pcm):
                 continue
             start = app.capture_started + offset / (2 * SAMPLE_RATE)

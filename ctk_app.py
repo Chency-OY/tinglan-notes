@@ -29,6 +29,28 @@ FONT = "Microsoft YaHei UI"
 ASSETS = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 
 
+def default_orb_position(main, size, scale):
+    """Bottom-right of the main window's monitor work area, in Tk screen pixels."""
+    import ctypes
+    from ctypes import wintypes
+
+    class MonitorInfo(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("monitor", wintypes.RECT),
+                    ("work", wintypes.RECT), ("flags", wintypes.DWORD)]
+
+    user32 = ctypes.windll.user32
+    user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+    user32.MonitorFromWindow.restype = wintypes.HANDLE
+    user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
+    monitor = user32.MonitorFromWindow(main.winfo_id(), 2)
+    info = MonitorInfo()
+    info.cbSize = ctypes.sizeof(info)
+    area = info.work if user32.GetMonitorInfoW(monitor, ctypes.byref(info)) else wintypes.RECT(
+        0, 0, main.winfo_screenwidth(), main.winfo_screenheight())
+    margin = round(12 * scale)
+    return max(area.left, area.right - size - margin), max(area.top, area.bottom - size - margin)
+
+
 def font(size, bold=False, family=FONT):
     return ctk.CTkFont(family=family, size=size, weight="bold" if bold else "normal")
 
@@ -195,7 +217,8 @@ class InterpreterWindow(ctk.CTk):
         self.titled_sessions = set()
         self.devices = {f"{i} · {d['name']}": i for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0}
         self.device = ctk.StringVar(value=next(iter(self.devices), "无可用麦克风"))
-        self.mode = ctk.StringVar(value=self.history_store.preference("translation_cadence", "每分钟翻译"))
+        saved_mode = self.history_store.preference("translation_cadence", "")
+        self.mode = ctk.StringVar(value="腾讯云 实时" if saved_mode == "腾讯云 实时" else "停顿翻译")
         self.status = ctk.StringVar(value="")
         portrait = Image.open(ASSETS / "icon.png").convert("RGBA")
         self.orbs = [orb_image(portrait, active) for active in (False, True)]
@@ -264,8 +287,8 @@ class InterpreterWindow(ctk.CTk):
         box = self.transcript
         factor = min(1.1, max(.85, self.body.winfo_width() / self.body._get_widget_scaling() / 620))
         for tag, size, color, before, after, weight in (
-            ("stamp", 9, MUTED, 10, 3, "normal"), ("original", 12, SUB, 0, 4, "normal"),
-            ("translation", 16, INK, 0, 12, "bold")):
+            ("stamp", 9, MUTED, 10, 3, "normal"), ("original", 11, SUB, 0, 4, "normal"),
+            ("translation", 11, INK, 0, 12, "normal")):
             box.tag_configure(tag, font=(FONT, max(8, round(size * factor * self.zoom)), weight),
                               foreground=color, spacing1=before, spacing3=after)
 
@@ -344,8 +367,7 @@ class InterpreterWindow(ctk.CTk):
         self.float_canvas = RecordOrb(win, self.orbs, scale, chroma, click, move_to)
         self.float_canvas.set_state(self.recording, not self.stop_event.is_set() or not self.recording)
         self.float_canvas.pack()
-        x, y = self.ball_position or (max(0, win.winfo_screenwidth() - size - 40),
-                                      max(0, win.winfo_screenheight() - size - 130))
+        x, y = self.ball_position or default_orb_position(self, size, scale)
         win.geometry(f"{size}x{size}+{x}+{y}")
         win.deiconify()
 
@@ -472,7 +494,7 @@ class InterpreterWindow(ctk.CTk):
         def caption(text):
             label(form, text, 11, SUB).pack(anchor="w", padx=4, pady=(12, 4))
         self.options = []
-        for name, var, values in (("录制模式", self.mode, ["每分钟翻译", "腾讯云 实时"]),
+        for name, var, values in (("录制模式", self.mode, ["停顿翻译", "腾讯云 实时"]),
                                    ("麦克风", self.device, list(self.devices) or ["无可用麦克风"])):
             caption(name)
             menu = ctk.CTkOptionMenu(form, variable=var, values=values, width=110, dynamic_resizing=False,
@@ -686,7 +708,7 @@ class InterpreterWindow(ctk.CTk):
         self.session_id = sid
         self.recording = True
         self.partial = ("", "")
-        self.status.set("正在收音" if realtime else "正在收音 · 每分钟翻译，暂停时提交末段")
+        self.status.set("正在收音" if realtime else "正在收音 · 停顿 1 秒后翻译")
         self._select(sid)
         self.update_overlay()
         if self.panel == "settings":
