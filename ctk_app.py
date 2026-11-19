@@ -31,6 +31,19 @@ FONT = "Microsoft YaHei UI"
 ASSETS = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 
 
+def desktop_folder() -> Path:
+    if sys.platform == "win32":
+        import ctypes
+
+        # Windows resolves the user's Desktop, including a redirected folder.
+        desktop_directory = 0x10  # CSIDL_DESKTOPDIRECTORY
+        buffer = ctypes.create_unicode_buffer(260)
+        result = ctypes.windll.shell32.SHGetFolderPathW(None, desktop_directory, None, 0, buffer)
+        if result == 0 and buffer.value:
+            return Path(buffer.value)
+    return Path.home() / "Desktop"
+
+
 def default_orb_position(main, size, scale):
     """Bottom-right of the main window's monitor work area, in Tk screen pixels."""
     import ctypes
@@ -241,7 +254,8 @@ class InterpreterWindow(ctk.CTk):
         self.export_results = queue.Queue()
         self.exporting_project = False
         self.before_settings = None
-        self.export_folder = ctk.StringVar(value=str(Path.home() / "Documents" / "同传记录"))
+        self.desktop_folder = desktop_folder()
+        self.export_folder = ctk.StringVar(value=str(self.desktop_folder))
         self.zoom = 1.
         self.stream = None
         self.current_run = None
@@ -565,9 +579,9 @@ class InterpreterWindow(ctk.CTk):
             self.status.set("项目里还没有会话")
             return
         name = dict(self.history_store.projects())[pid]
-        folder = Path(self.export_folder.get()).expanduser()
+        folder = Path(self.export_folder.get().strip()).expanduser()
         path = filedialog.asksaveasfilename(parent=self, title="导出整个项目（含已归档会话）", defaultextension=".zip",
-            filetypes=[("ZIP 压缩包", "*.zip")], initialdir=str(folder if folder.is_dir() else Path.home() / "Documents"),
+            filetypes=[("ZIP 压缩包", "*.zip")], initialdir=str(folder if folder.is_absolute() and folder.is_dir() else self.desktop_folder),
             initialfile=f"项目_{safe_filename(name)}_{datetime.now():%Y%m%d}.zip")
         if not path:
             return
