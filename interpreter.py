@@ -11,6 +11,9 @@ import os
 import queue
 import secrets
 import sqlite3
+import re
+import tempfile
+import zipfile
 import sys
 import threading
 import time
@@ -38,6 +41,10 @@ def clock_text(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def safe_filename(text):
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', text)[:60].strip(' .') or '未命名'
+
+
 class HistoryStore:
     def __init__(self, path: Path | None = None):
         self.path = path or DATA_DIR / "history.sqlite3"
@@ -54,25 +61,35 @@ class HistoryStore:
                     source TEXT NOT NULL, target TEXT NOT NULL,
                     FOREIGN KEY(session_id) REFERENCES sessions(id)
                 );
+                CREATE TABLE IF NOT EXISTS projects (
+                    id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE
+                );
                 CREATE TABLE IF NOT EXISTS preferences (
                     name TEXT PRIMARY KEY, value TEXT NOT NULL
                 );
             """)
-            if "title" not in {row[1] for row in db.execute("PRAGMA table_info(sessions)")}:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(sessions)")}
+            if "project_id" not in columns:
+                db.execute("ALTER TABLE sessions ADD COLUMN project_id INTEGER REFERENCES projects(id)")
+            if "archived" not in columns:
+                db.execute("ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+            db.execute("CREATE INDEX IF NOT EXISTS segments_by_session ON segments(session_id,id)")
+            if "title" not in columns:
                 db.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
 
     @contextmanager
     def connect(self):
         db = sqlite3.connect(self.path, timeout=10)
         try:
+            db.execute("PRAGMA foreign_keys=ON")
             with db:
                 yield db
         finally:
             db.close()
 
-    def begin(self, provider: str, title=None) -> int:
+    def begin(self, provider: str, title=None, project_id=None) -> int:
         with self.connect() as db:
-            cursor = db.execute("INSERT INTO sessions(started,provider,title) VALUES (?,?,?)", (time.time(), provider, title))
+            cursor = db.execute("INSERT INTO sessions(started,provider,title,project_id) VALUES (?,?,?,?)", (time.time(), provider, title, project_id))
             return cursor.lastrowid
 
     def end(self, session_id: int, ended=None):
@@ -106,11 +123,63 @@ class HistoryStore:
         with self.connect() as db:
             return db.execute("SELECT id,started,ended,provider FROM sessions WHERE id=?", (session_id,)).fetchone()
 
-    def session_previews(self):
+    def session_previews(self, project_id=None, archived=False):
         with self.connect() as db:
-            return db.execute("""
-                SELECT id, started, title FROM sessions ORDER BY started DESC, id DESC
-            """).fetchall()
+            return db.execute("""SELECT id,started,title FROM sessions WHERE archived=?
+                AND (? IS NULL OR project_id=?) ORDER BY started DESC,id DESC""",
+                (int(archived), project_id, project_id)).fetchall()
+
+    def projects(self):
+        with self.connect() as db:
+            return db.execute("SELECT id,name FROM projects ORDER BY name COLLATE NOCASE,id").fetchall()
+
+    def create_project(self, name):
+        name = name.strip()
+        if not 1 <= len(name) <= 80:
+            raise ValueError("项目名请输入 1 至 80 个字")
+        with self.connect() as db:
+            try:
+                return db.execute("INSERT INTO projects(name) VALUES (?)", (name,)).lastrowid
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("已有同名项目") from exc
+
+    def move_session(self, sid, project_id):
+        with self.connect() as db:
+            db.execute("UPDATE sessions SET project_id=? WHERE id=?", (project_id,sid))
+
+    def archive_session(self, sid, archived=True):
+        with self.connect() as db:
+            db.execute("UPDATE sessions SET archived=? WHERE id=?", (int(archived),sid))
+
+    def project_zip(self, pid, destination):
+        # Take one consistent snapshot, then release SQLite before compressing files.
+        with self.connect() as db:
+            db.execute("BEGIN")
+            sessions = db.execute("SELECT id,started,ended,title FROM sessions WHERE project_id=? ORDER BY started,id", (pid,)).fetchall()
+            if not sessions:
+                raise ValueError("项目里还没有会话")
+            segments = db.execute("""SELECT g.session_id,g.started,g.ended,g.source,g.target FROM segments g
+                JOIN sessions s ON s.id=g.session_id WHERE s.project_id=? ORDER BY g.session_id,g.id""", (pid,)).fetchall()
+        grouped = {}
+        for sid, *row in segments:
+            grouped.setdefault(sid, []).append(row)
+        dest = Path(destination)
+        with tempfile.NamedTemporaryFile(dir=dest.parent, suffix=".tmp", delete=False) as tmp:
+            temp = Path(tmp.name)
+        try:
+            with zipfile.ZipFile(temp, "w", zipfile.ZIP_DEFLATED) as archive:
+                for sid, start, end, title in sessions:
+                    date = datetime.fromtimestamp(start)
+                    title = title or date.strftime("%m.%d %H:%M")
+                    folder = f"{date:%Y%m%d_%H%M%S}_{sid}_{safe_filename(title)}"
+                    header = [title, f"开始：{clock_text(start)}", f"结束：{clock_text(end) if end else '进行中'}", ""]
+                    for suffix, col in (("原文",2),("译文",3)):
+                        lines = header + [f"[{clock_text(r[0])} – {clock_text(r[1])}] {r[col]}" for r in grouped.get(sid, ())]
+                        archive.writestr(f"{folder}/{suffix}.txt", ("\r\n".join(lines)+"\r\n").encode("utf-8-sig"))
+            os.replace(temp, dest)
+        finally:
+            temp.unlink(missing_ok=True)
+        return len(sessions)
 
     def title(self, sid):
         with self.connect() as db:

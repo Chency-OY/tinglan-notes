@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from tkinter import filedialog
 from datetime import datetime
 from pathlib import Path
 
@@ -15,7 +16,7 @@ import keyring
 import sounddevice as sd
 from PIL import Image, ImageDraw, ImageOps
 
-from interpreter import FRAME_SAMPLES, SAMPLE_RATE, SERVICE, HistoryStore, Interpreter as AudioBackend, clock_text
+from interpreter import FRAME_SAMPLES, SAMPLE_RATE, SERVICE, HistoryStore, Interpreter as AudioBackend, clock_text, safe_filename
 from routes import KEYS, priority_loop, priority_order
 
 PAPER = "#FAFBFE"
@@ -232,6 +233,13 @@ class InterpreterWindow(ctk.CTk):
         self.session_id = self.view_id = None
         self.recording = self.closing = False
         self.panel = None
+        self.library_view = "recent"
+        self.library_project = self.draft_project = None
+        self.organizing = None
+        self.project_form_open = False
+        self.project_name = ctk.StringVar(value="")
+        self.export_results = queue.Queue()
+        self.exporting_project = False
         self.before_settings = None
         self.export_folder = ctk.StringVar(value=str(Path.home() / "Documents" / "同传记录"))
         self.zoom = 1.
@@ -407,6 +415,7 @@ class InterpreterWindow(ctk.CTk):
 
     def set_panel(self, name):
         self.panel = name
+        self.project_form_open = False
         for child in self.side.winfo_children():
             child.destroy()
         self.history_toggle.configure(fg_color=SELECT if name == "history" else "transparent")
@@ -436,14 +445,49 @@ class InterpreterWindow(ctk.CTk):
             self._history_list()
 
     def _history_list(self):
-        if self.panel != "history":
+        if self.panel != "history" or self.project_form_open:
             return
         for child in self.listing.winfo_children():
             child.destroy()
+        def nav(text, command):
+            return button(self.listing, text, command, anchor="w").pack(fill="x", pady=1)
+
+        view = self.library_view
+        projects = dict(self.history_store.projects())
+        if self.organizing is not None:
+            sid = self.organizing
+            nav("‹   返回会话列表", lambda: self._browse(view, self.library_project))
+            label(self.listing, self.history_store.title(sid)[:18], 12, bold=True).pack(anchor="w", padx=6, pady=6)
+            restore = view == "archive"
+            nav("恢复到会话列表" if restore else "归档会话", lambda: self._archive(sid, not restore))
+            label(self.listing, "移入项目", 11, MUTED).pack(anchor="w", padx=6, pady=(8, 2))
+            for pid, name in projects.items():
+                nav(name, lambda n=pid: self._move(sid, n))
+            nav("＋   新建项目并移入", lambda: self._create_project_form(sid))
+            nav("移出项目", lambda: self._move(sid, None))
+            return
+        if view == "recent":
+            nav("项目   ›", lambda: self._browse("projects"))
+            nav("已归档   ›", lambda: self._browse("archive"))
+        elif view == "projects":
+            nav("‹   最近会话", lambda: self._browse("recent"))
+            nav("＋   创建项目", self._create_project_form)
+            for pid, name in projects.items():
+                nav(name, lambda n=pid: self._browse("project", n))
+            return
+        elif view == "project":
+            nav("‹   所有项目", lambda: self._browse("projects"))
+            label(self.listing, projects.get(self.library_project, "项目"), 13, bold=True,
+                  wraplength=150, justify="left").pack(anchor="w", padx=6, pady=4)
+            nav("导出项目 ZIP", self._export_project)
+        else:
+            nav("‹   最近会话", lambda: self._browse("recent"))
+            label(self.listing, "已归档", 13, bold=True).pack(anchor="w", padx=6, pady=4)
         group = None
-        rows = self.history_store.session_previews()
+        rows = self.history_store.session_previews(self.library_project, view == "archive")
         if not rows:
-            label(self.listing, "录制后，会话会出现在这里", 11, MUTED).pack(anchor="w", padx=6, pady=6)
+            label(self.listing, {"recent":"还没有会话", "project":"这里还没有未归档的会话", "archive":"还没有归档的会话"}[view],
+                  11, MUTED).pack(anchor="w", padx=6, pady=6)
         for sid, started, title in rows:
             date = datetime.fromtimestamp(started)
             day = "今天" if date.date() == datetime.now().date() else date.strftime("%Y/%m/%d")
@@ -453,6 +497,9 @@ class InterpreterWindow(ctk.CTk):
             card = ctk.CTkFrame(self.listing, fg_color=SELECT if sid == self.view_id else "transparent", corner_radius=10)
             card.pack(fill="x", pady=2)
             text = title or date.strftime("%m.%d %H:%M")
+            more = button(card, "⋯", lambda n=sid: self._organize(n), 22)
+            more.configure(border_spacing=0)
+            more.pack(side="right")
             for icon, command in (
                 (self.delete_icon, lambda s=sid, c=card: self.confirm_delete(s, c)),
                 (self.edit_icon, lambda s=sid: self.rename_from_history(s)),
@@ -461,6 +508,79 @@ class InterpreterWindow(ctk.CTk):
                 action.configure(image=icon, corner_radius=5, border_spacing=0)
                 action.pack(side="right", padx=1)
             button(card, text, lambda s=sid: self.select_session(s), width=36, anchor="w").pack(side="left", fill="x", expand=True)
+
+    def _browse(self, view, pid=None):
+        self.project_form_open = False
+        self.library_view, self.library_project, self.organizing = view, pid, None
+        self._history_list()
+        self.listing._parent_canvas.yview_moveto(0)
+
+    def _organize(self, sid):
+        self.organizing = sid
+        self._history_list()
+        self.listing._parent_canvas.yview_moveto(0)
+
+    def _archive(self, sid, archive):
+        self.history_store.archive_session(sid, archive)
+        self._browse(self.library_view, self.library_project)
+        self.status.set("已归档 · 可在已归档中恢复" if archive else "已恢复 · 保留原有项目")
+
+    def _move(self, sid, pid):
+        self.history_store.move_session(sid, pid)
+        self._browse(self.library_view, self.library_project)
+        self.status.set("已移入项目" if pid else "已移出项目")
+
+    def _create_project_form(self, sid=None):
+        self.project_form_open = True
+        for child in self.listing.winfo_children():
+            child.destroy()
+        label(self.listing, "创建项目", 14, bold=True).pack(anchor="w", padx=6, pady=8)
+        self.project_name.set("")
+        entry = ctk.CTkEntry(self.listing, textvariable=self.project_name, placeholder_text="项目名称", fg_color=PAPER, border_color=BORDER)
+        entry.pack(fill="x", pady=4)
+        def save():
+            try:
+                pid = self.history_store.create_project(self.project_name.get())
+            except ValueError as exc:
+                self.status.set(str(exc))
+                return
+            if sid is not None:
+                self.history_store.move_session(sid, pid)
+            self._browse("project", pid)
+            self.status.set("项目已创建" if sid is None else "项目已创建，会话已移入")
+        entry.bind("<Return>", lambda _: save())
+        button(self.listing, "创建并移入" if sid else "创建", save, fill=SELECT).pack(fill="x", pady=4)
+        def cancel():
+            self.project_form_open = False
+            self._history_list()
+        button(self.listing, "取消", cancel).pack(fill="x")
+        entry.focus_set()
+
+    def _export_project(self):
+        if self.exporting_project:
+            self.status.set("正在导出项目，请稍候")
+            return
+        pid = self.library_project
+        if not any(self.history_store.session_previews(pid, archived) for archived in (False, True)):
+            self.status.set("项目里还没有会话")
+            return
+        name = dict(self.history_store.projects())[pid]
+        folder = Path(self.export_folder.get()).expanduser()
+        path = filedialog.asksaveasfilename(parent=self, title="导出整个项目（含已归档会话）", defaultextension=".zip",
+            filetypes=[("ZIP 压缩包", "*.zip")], initialdir=str(folder if folder.is_dir() else Path.home() / "Documents"),
+            initialfile=f"项目_{safe_filename(name)}_{datetime.now():%Y%m%d}.zip")
+        if not path:
+            return
+        self.exporting_project = True
+        self.status.set("正在打包已保存的原文和译文…")
+        def write_zip():
+            try:
+                count = self.history_store.project_zip(pid, path)
+                result = f"已导出 {count} 个会话：{Path(path).name}"
+            except Exception as exc:
+                result = f"导出失败：{exc}"
+            self.export_results.put(result)
+        threading.Thread(target=write_zip, name="project-export").start()
 
     def rename_from_history(self, sid):
         self.select_session(sid)
@@ -670,6 +790,7 @@ class InterpreterWindow(ctk.CTk):
             self.status.set("请先点击头像暂停当前录制")
             return
         self.session_id = None
+        self.draft_project = self.library_project if self.panel == "history" and self.library_view == "project" else None
         self.draft_title = ""
         if self.panel == "export":
             self.set_panel(None)
@@ -724,7 +845,7 @@ class InterpreterWindow(ctk.CTk):
             run.capture_started = time.time()
             self.stream.start()
             if self.view_id is None:
-                sid = self.history_store.begin(routes[0], self.draft_title or None)
+                sid = self.history_store.begin(routes[0], self.draft_title or None, self.draft_project)
                 self.draft_title = ""
             else:
                 sid = self.view_id
@@ -823,7 +944,10 @@ class InterpreterWindow(ctk.CTk):
                 self._receive(run, event)
                 if event[0] == "finished":
                     break
-        if self.closing and not self.pending_runs:
+        if not self.export_results.empty():
+            self.exporting_project = False
+            self.status.set(self.export_results.get_nowait())
+        if self.closing and not self.pending_runs and not self.exporting_project:
             self.destroy()
         else:
             self.after(80, self.poll)
@@ -835,6 +959,8 @@ class InterpreterWindow(ctk.CTk):
         if self.pending_runs:
             self._dock_state()
             self.status.set("已停止收音 · 完成剩余翻译后自动退出")
+        elif self.exporting_project:
+            self.status.set("完成项目导出后自动退出")
         else:
             self.destroy()
 
