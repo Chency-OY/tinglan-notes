@@ -19,8 +19,9 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from interpreter import FRAME_SAMPLES, SAMPLE_RATE, SERVICE, HistoryStore, Interpreter as AudioBackend, clock_text, safe_filename
 from routes import KEYS, priority_loop, priority_order
-from window_chrome import WindowsTitleStrip
+from window_chrome import WindowsTitleStrip, main_frame_handle, show_main_on_taskbar
 
+APP_TITLE = "中英同传字幕"
 PAPER = "#FAFBFE"
 SIDE = "#EEF2FB"
 INK = "#303B59"
@@ -345,7 +346,7 @@ class InterpreterWindow(ctk.CTk):
         ctk.set_appearance_mode("light")
         super().__init__(fg_color=PAPER)
         self.withdraw()
-        self.title("中英同传字幕")
+        self.title(APP_TITLE)
         self.iconbitmap(str(ASSETS / "icon.ico"))
         self.geometry("800x460")
         self.minsize(540, 300)
@@ -420,9 +421,15 @@ class InterpreterWindow(ctk.CTk):
         self.bind("<MouseWheel>", self._scroll_outside_row_menu, add="+")
         self.bind("<Configure>", self._resize_row_menu, add="+")
         self.bind("<Control-b>", lambda _: self.toggle_history())
+        self.deiconify()
+        if sys.platform == "win32":
+            self.after_idle(self._ensure_taskbar_window)
         self.after_idle(self.update_overlay)
         self.after(80, self.poll)
-        self.deiconify()
+
+    def _ensure_taskbar_window(self):
+        if not self.closing:
+            show_main_on_taskbar(main_frame_handle(self))
 
     def _build_header(self):
         bar = ctk.CTkFrame(self.main, fg_color="transparent")
@@ -1671,11 +1678,9 @@ def main():
             windows.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
             windows.FindWindowW.restype = wintypes.HWND
             for _ in range(40):
-                hwnd = windows.FindWindowW("TkTopLevel", "中英同传字幕")
+                hwnd = windows.FindWindowW("TkTopLevel", APP_TITLE)
                 if hwnd:
-                    if windows.IsIconic(wintypes.HWND(hwnd)):
-                        windows.ShowWindow(wintypes.HWND(hwnd), 9)
-                    windows.SetForegroundWindow(wintypes.HWND(hwnd))
+                    show_main_on_taskbar(hwnd, activate=True)
                     break
                 time.sleep(.1)
         else:

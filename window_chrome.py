@@ -4,7 +4,50 @@ from __future__ import annotations
 import ctypes
 import tkinter as tk
 from ctypes import wintypes
+from functools import cache
 from tkinter import font as tkfont
+
+
+@cache
+def _window_api():
+    user32 = ctypes.WinDLL("user32")
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetAncestor.restype = wintypes.HWND
+    user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowLongW.restype = wintypes.LONG
+    user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    user32.SetWindowPos.restype = wintypes.BOOL
+    return user32
+
+
+def main_frame_handle(window):
+    frame = int(str(window.tk.call("wm", "frame", window._w)), 0)
+    return _window_api().GetAncestor(frame, 2)  # GA_ROOT: outside Tk's client child.
+
+
+def show_main_on_taskbar(hwnd, *, activate=False):
+    if not hwnd:
+        return False
+    user32 = _window_api()
+    exstyle = user32.GetWindowLongW(hwnd, -20)
+    taskbar_style = (exstyle | 0x00040000) & ~0x00000080  # WS_EX_APPWINDOW without WS_EX_TOOLWINDOW.
+    if taskbar_style != exstyle:
+        user32.SetWindowLongW(hwnd, -20, taskbar_style)
+    if user32.IsIconic(hwnd):
+        if activate:
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE, keeping the prior restore/maximize position.
+    elif not user32.IsWindowVisible(hwnd):
+        # Explicitly show the main frame even if the process inherited a hidden launch state.
+        user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0057)  # SHOWWINDOW; keep size, position and focus.
+    if activate:
+        user32.SetForegroundWindow(hwnd)
+    return bool(user32.IsWindowVisible(hwnd))
 
 
 class WindowsTitleStrip(tk.Canvas):
@@ -53,8 +96,6 @@ class WindowsTitleStrip(tk.Canvas):
         proc = ctypes.WINFUNCTYPE(result, wintypes.HWND, wintypes.UINT, pointer, signed, pointer, pointer)
         self.callback = proc(self._dispatch)
         self.subclass_id = id(self)
-        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
-        user32.GetAncestor.restype = wintypes.HWND
         user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
         user32.GetClientRect.restype = wintypes.BOOL
         user32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
@@ -78,9 +119,7 @@ class WindowsTitleStrip(tk.Canvas):
         self.comctl.DefSubclassProc.restype = result
 
         # Tk's child window lives inside the mapped Windows frame that owns the system caption.
-        window = self.master
-        frame = int(str(window.tk.call("wm", "frame", window._w)), 0)
-        hwnd = user32.GetAncestor(frame, 2)
+        hwnd = main_frame_handle(self.master)
         if not hwnd or not self.comctl.SetWindowSubclass(hwnd, self.callback, self.subclass_id, 0):
             return False
         self.hwnd = hwnd
