@@ -37,7 +37,11 @@ class PauseDuringUploadTests(unittest.TestCase):
                 patch("routes.translate_segment", side_effect=translate), patch("routes.webrtcvad.Vad") as vad:
             vad.return_value.is_speech.side_effect = lambda frame, rate: frame.startswith(b"B")
             db = HistoryStore(Path(tmp) / "test.db")
+            db.set_preference("priority", "腾讯云|Kimi 订阅|DeepSeek")
+            db.set_preference("translation_cadence", "腾讯云 实时")
             app = InterpreterWindow(db)
+            self.assertEqual(app.priority, ["Kimi 订阅", "DeepSeek"])
+
             def wait_for(check):
                 limit = time.monotonic() + 10
                 while not check() and time.monotonic() < limit:
@@ -49,6 +53,7 @@ class PauseDuringUploadTests(unittest.TestCase):
                 wait_for(lambda: app.recording)
                 run = app.current_run
                 sid = run.session_id
+                self.assertEqual(run.active_routes, ["Kimi 订阅", "DeepSeek"])
                 silence = bytes(2*SAMPLE_RATE)
                 speech = b"B\x01"*SAMPLE_RATE
                 weak = b"a\x00"*SAMPLE_RATE  # The detector misses this quiet second.

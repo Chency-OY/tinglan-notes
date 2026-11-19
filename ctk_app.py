@@ -19,6 +19,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from interpreter import FRAME_SAMPLES, SAMPLE_RATE, SERVICE, HistoryStore, Interpreter as AudioBackend, clock_text, safe_filename
 from routes import KEYS, priority_loop, priority_order
+from window_chrome import WindowsTitleStrip
 
 PAPER = "#FAFBFE"
 SIDE = "#EEF2FB"
@@ -320,11 +321,9 @@ class RecordingRun:
         self.capture_started = 0.
         self.failure = ""
 
-    def process(self, backend):
+    def process(self):
         try:
-            if backend is AudioBackend.tencent_loop and self.previous_saved is not None:
-                self.previous_saved.wait()
-            backend(self)
+            priority_loop(self)
         except Exception as exc:
             self.events.put(("status", f"录制中断 · {type(exc).__name__}"))
         finally:
@@ -336,7 +335,6 @@ class CaptureStart:
     sid: int | None
     project_id: int | None
     title: str
-    realtime: bool
     cancelled: threading.Event = field(default_factory=threading.Event)
     result: queue.SimpleQueue = field(default_factory=queue.SimpleQueue)
 
@@ -346,6 +344,7 @@ class InterpreterWindow(ctk.CTk):
     def __init__(self, history_store=None):
         ctk.set_appearance_mode("light")
         super().__init__(fg_color=PAPER)
+        self.withdraw()
         self.title("中英同传字幕")
         self.iconbitmap(str(ASSETS / "icon.ico"))
         self.geometry("800x460")
@@ -354,7 +353,7 @@ class InterpreterWindow(ctk.CTk):
         self.attributes("-alpha", 1.0)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.history_store = history_store or HistoryStore()
-        self.priority = priority_order(self.history_store.preference("priority", "DeepSeek|Kimi 订阅|腾讯云"))
+        self.priority = priority_order(self.history_store.preference("priority", ""))
         self.float_enabled = ctk.BooleanVar(value=self.history_store.preference("overlay", "1") == "1")
         self.overlay = self.overlay_ticker = None
         self.overlay_subtitle = ""
@@ -391,8 +390,6 @@ class InterpreterWindow(ctk.CTk):
         self.partial = ("", "")
         self.devices = {f"{i} · {d['name']}": i for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0}
         self.device = ctk.StringVar(value=next(iter(self.devices), "无可用麦克风"))
-        saved_mode = self.history_store.preference("translation_cadence", "")
-        self.mode = ctk.StringVar(value="腾讯云 实时" if saved_mode == "腾讯云 实时" else "停顿翻译")
         self.status = ctk.StringVar(value="")
         portrait = Image.open(ASSETS / "icon.png").convert("RGBA")
         self.orbs = [orb_image(portrait, active) for active in (False, True)]
@@ -400,12 +397,16 @@ class InterpreterWindow(ctk.CTk):
         self.folder_icons = (project_icon(), project_icon(opened=True))
         self.sidebar_font = font(12)
         self.sidebar_icons = {glyph: sidebar_glyph(glyph) for glyph in ("\ue70f", "\ue713", "\ue7b8", "\ue8c8", "\ue710", "\ue896", "\ue74d", "\ue8b7", "\ue72b")}
-        self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
         self.side = ctk.CTkFrame(self, width=224, corner_radius=0, fg_color=SIDE)
         self.side.pack_propagate(False)
+        self.title_strip = WindowsTitleStrip.install(self, self.side._get_widget_scaling()) if sys.platform == "win32" else None
+        self.content_row = int(self.title_strip is not None)
+        self.grid_rowconfigure(self.content_row, weight=1)
+        if self.title_strip is not None:
+            self.title_strip.grid(row=0, column=0, columnspan=2, sticky="ew")
         self.main = ctk.CTkFrame(self, corner_radius=0, fg_color=PAPER)
-        self.main.grid(row=0, column=1, sticky="nsew")
+        self.main.grid(row=self.content_row, column=1, sticky="nsew")
         self.main.grid_columnconfigure(0, weight=1)
         self.main.grid_rowconfigure(1, weight=1)
         self._build_header()
@@ -421,6 +422,7 @@ class InterpreterWindow(ctk.CTk):
         self.bind("<Control-b>", lambda _: self.toggle_history())
         self.after_idle(self.update_overlay)
         self.after(80, self.poll)
+        self.deiconify()
 
     def _build_header(self):
         bar = ctk.CTkFrame(self.main, fg_color="transparent")
@@ -717,10 +719,10 @@ class InterpreterWindow(ctk.CTk):
             self.side.grid_remove()
             return
         self.history_toggle.pack_forget()
-        self.side.grid(row=0, column=0, sticky="ns")
+        self.side.grid(row=self.content_row, column=0, sticky="ns")
         row = ctk.CTkFrame(self.side, fg_color="transparent")
         row.pack(fill="x", padx=(15, 9), pady=(10, 4))
-        label(row, "中英同传", 14, bold=True).pack(side="left")
+        label(row, "会话" if self.title_strip is not None else "中英同传", 13, bold=True).pack(side="left")
         close = button(row, "", lambda: self.set_panel(None), 28)
         close.configure(image=sidebar_icon())
         close.pack(side="right")
@@ -1236,18 +1238,15 @@ class InterpreterWindow(ctk.CTk):
             label(parent, text, 12, INK, bold=True).pack(anchor="w", padx=3, pady=(5, 3))
 
         recording = sections["录制"][1]
-        self.options = []
-        for name, var, values in (
-            ("麦克风", self.device, list(self.devices) or ["无可用麦克风"]),
-            ("录制模式", self.mode, ["停顿翻译", "腾讯云 实时"]),
-        ):
-            caption(recording, name)
-            menu = ctk.CTkOptionMenu(recording, variable=var, values=values, width=110, dynamic_resizing=False,
-                                     fg_color="white", button_color="#DCE5F6", button_hover_color=SELECT,
-                                     text_color=INK, dropdown_fg_color=PAPER, dropdown_text_color=INK,
-                                     state="disabled" if self.recording or self.start_request else "normal", font=font(12))
-            menu.pack(fill="x", padx=3, pady=(0, 4))
-            self.options.append(menu)
+        caption(recording, "麦克风")
+        device_menu = ctk.CTkOptionMenu(
+            recording, variable=self.device, values=list(self.devices) or ["无可用麦克风"],
+            width=110, dynamic_resizing=False, fg_color="white", button_color="#DCE5F6",
+            button_hover_color=SELECT, text_color=INK, dropdown_fg_color=PAPER, dropdown_text_color=INK,
+            state="disabled" if self.recording or self.start_request else "normal", font=font(12),
+        )
+        device_menu.pack(fill="x", padx=3, pady=(0, 4))
+        self.options = [device_menu]
 
         services = sections["翻译服务"][1]
         caption(services, "API 优先级")
@@ -1275,7 +1274,6 @@ class InterpreterWindow(ctk.CTk):
         self.entries = {}
         for name, account in (
             ("Kimi Code 订阅 Key", "kimi_key"), ("DeepSeek API Key", "deepseek_key"),
-            ("腾讯云 AppID", "tencent_appid"), ("腾讯云 SecretId", "tencent_id"), ("腾讯云 SecretKey", "tencent_key"),
         ):
             caption(services, name)
             entry = ctk.CTkEntry(services, show="*", border_width=1, border_color=BORDER, fg_color="white", text_color=INK)
@@ -1325,7 +1323,6 @@ class InterpreterWindow(ctk.CTk):
             return
         self.priority = list(self.pending_priority)
         self.history_store.set_preference("priority", "|".join(self.priority))
-        self.history_store.set_preference("translation_cadence", self.mode.get())
         self.history_store.set_preference("overlay", str(int(self.float_enabled.get())))
         self.close_settings()
         self.status.set("设置已保存")
@@ -1454,11 +1451,10 @@ class InterpreterWindow(ctk.CTk):
         if device is None:
             self._start_failed("请选择可用的麦克风", "录制")
             return
-        realtime = self.mode.get() == "腾讯云 实时"
-        request = self.start_request = CaptureStart(self.view_id, self.draft_project, self.draft_title, realtime)
+        request = self.start_request = CaptureStart(self.view_id, self.draft_project, self.draft_title)
         self.status.set("正在启动麦克风…")
         self._dock_state()
-        candidates = ["腾讯云"] if realtime else list(self.priority)
+        candidates = list(self.priority)
         threading.Thread(target=self._open_capture, args=(request, candidates, device),
                          name="microphone-start", daemon=True).start()
         self.after(25, self._finish_capture_start)
@@ -1541,7 +1537,7 @@ class InterpreterWindow(ctk.CTk):
         self.partial = ("", "")
         if new:
             self._add_recording_row(sid, request.project_id)
-        self.status.set("正在收音" if request.realtime else "正在收音 · 停顿 1 秒后翻译")
+        self.status.set("正在收音 · 停顿 1 秒后翻译")
         if self.view_id == request.sid:
             if new:
                 self._select(sid)
@@ -1552,8 +1548,7 @@ class InterpreterWindow(ctk.CTk):
                     self.empty_title.configure(text="正在聆听")
                     self.empty_hint.configure(text="识别到的原文和译文会逐段显示")
         self._dock_state()
-        backend = AudioBackend.tencent_loop if request.realtime else priority_loop
-        threading.Thread(target=run.process, args=(backend,), daemon=True).start()
+        threading.Thread(target=run.process, daemon=True).start()
 
     def _start_failed(self, error, settings_tab=None):
         self._dock_state()

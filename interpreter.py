@@ -1,15 +1,10 @@
 """Bilingual microphone subtitles for Windows."""
 from __future__ import annotations
 
-import base64
 from contextlib import contextmanager
-import hashlib
-import hmac
 import io
-import json
 import os
 import queue
-import secrets
 import sqlite3
 import re
 import tempfile
@@ -21,15 +16,12 @@ import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from urllib.parse import urlencode
-import uuid
 import wave
 
 import httpx
 import keyring
 import numpy as np
 import sounddevice as sd
-import websocket
 
 SERVICE = "zh-en-live-interpreter"
 SAMPLE_RATE = 16000
@@ -239,25 +231,6 @@ def wav_bytes(pcm: bytes) -> bytes:
     return out.getvalue()
 
 
-def tencent_url(appid: str, secret_id: str, secret_key: str) -> str:
-    now = int(time.time())
-    path = f"asr.cloud.tencent.com/asr/speech_translate/{appid}"
-    params = {
-        "expired": now + 3600,
-        "nonce": secrets.randbelow(2**31),
-        "secretid": secret_id,
-        "source": "zh_en",
-        "target": "zh_en",
-        "timestamp": now,
-        "trans_model": "hunyuan-translation-lite",
-        "voice_format": 1,
-        "voice_id": str(uuid.uuid4()),
-    }
-    query = urlencode(sorted(params.items()))
-    signature = base64.b64encode(hmac.new(secret_key.encode(), f"{path}?{query}".encode(), hashlib.sha1).digest()).decode()
-    return f"wss://{path}?{query}&signature={urlencode({'signature': signature}).split('=', 1)[1]}"
-
-
 class Segmenter:
     """Emit speech after a short pause, or every four seconds of continuous speech."""
 
@@ -316,7 +289,6 @@ class Interpreter(tk.Tk):
         self.minsize(540, 260)
         self.configure(bg="#f1f6ff")
         self.protocol("WM_DELETE_WINDOW", self.close)
-        self.mode = tk.StringVar(value="DeepSeek 近实时")
         self.device = tk.StringVar()
         self.status = tk.StringVar(value="未启动")
         self.events: queue.Queue[tuple] = queue.Queue()
@@ -357,8 +329,6 @@ class Interpreter(tk.Tk):
         PillButton(top, "设置", self.settings, width=72, fill="#dce6fb").pack(side="right")
         controls = tk.Frame(self.compact_view, bg="#f1f6ff")
         controls.pack(fill="x", padx=19, pady=(0, 10))
-        self.mode_combo = ttk.Combobox(controls, textvariable=self.mode, values=["DeepSeek 近实时", "腾讯云 实时"], state="readonly", width=15)
-        self.mode_combo.pack(side="left", padx=(0, 8))
         self.device_combo = ttk.Combobox(controls, textvariable=self.device, values=names, state="readonly", width=22)
         self.device_combo.pack(side="left", fill="x", expand=True)
         self.start_button = PillButton(controls, "● 开始", self.toggle, width=91, fill="#c8d3f6")
@@ -531,7 +501,7 @@ class Interpreter(tk.Tk):
         tk.Label(header, text="服务设置", bg="#f8faff", fg="#3a3360", font=("Microsoft YaHei UI", 19, "bold")).pack(side="left", padx=(17, 0))
         form = tk.Frame(page, bg="#ffffff", highlightbackground="#dfe7fb", highlightthickness=1)
         form.pack(fill="x", padx=80, pady=(0, 20))
-        fields = [("DeepSeek API Key", "deepseek_key"), ("腾讯云 AppID", "tencent_appid"), ("腾讯云 SecretId", "tencent_id"), ("腾讯云 SecretKey", "tencent_key")]
+        fields = [("DeepSeek API Key", "deepseek_key")]
         entries = {}
         for row, (label, account) in enumerate(fields):
             tk.Label(form, text=label, bg="#ffffff", fg="#536a9b").grid(row=row, column=0, padx=(25, 18), pady=16, sticky="w")
@@ -557,12 +527,10 @@ class Interpreter(tk.Tk):
             if self.stream: self.stream.stop(); self.stream.close(); self.stream = None
             if self.session_id is not None: self.history_store.end(self.session_id)
             self.start_button.set_label("● 开始", "#c8d3f6")
-            self.mode_combo.configure(state="readonly")
             self.device_combo.configure(state="readonly")
             self.status.set("正在停止")
             return
-        credentials = (["deepseek_key"] if self.mode.get().startswith("DeepSeek") else ["tencent_appid", "tencent_id", "tencent_key"])
-        if any(not keyring.get_password(SERVICE, x) for x in credentials):
+        if not keyring.get_password(SERVICE, "deepseek_key"):
             messagebox.showinfo("需要密钥", "请先在“密钥设置”中填写当前服务的凭据。")
             return
         if self.device.get() not in self.devices:
@@ -577,17 +545,15 @@ class Interpreter(tk.Tk):
             self.stream = None
             messagebox.showerror("麦克风启动失败", str(exc))
             return
-        target = self.deepseek_loop if self.mode.get().startswith("DeepSeek") else self.tencent_loop
-        self.worker = threading.Thread(target=target, daemon=True)
+        self.worker = threading.Thread(target=self.deepseek_loop, daemon=True)
         self.capture_started = time.time()
         if self.session_id is None:
-            self.session_id = self.history_store.begin(self.mode.get())
+            self.session_id = self.history_store.begin("DeepSeek")
             self.session_label.configure(text=f"本次会话 #{self.session_id} · {clock_text(self.capture_started)}")
         else:
             self.history_store.resume(self.session_id)
         self.worker.start()
         self.start_button.set_label("Ⅱ 暂停", "#f3d399")
-        self.mode_combo.configure(state="disabled")
         self.device_combo.configure(state="disabled")
         self.status.set("正在收音")
 
@@ -637,53 +603,6 @@ class Interpreter(tk.Tk):
         processor.join()
         self.events.put(("status", "已暂停"))
 
-    def tencent_loop(self):
-        session_id = self.session_id
-        ws = None
-        try:
-            keys = getattr(self, "route_keys", None)
-            creds = [keys[x] if keys is not None else keyring.get_password(SERVICE, x)
-                     for x in ("tencent_appid", "tencent_id", "tencent_key")]
-            ws = websocket.create_connection(tencent_url(*creds), timeout=10)
-            ws.settimeout(1)
-            finished = threading.Event()
-            def receive():
-                while not finished.is_set():
-                    try: message = ws.recv()
-                    except websocket.WebSocketTimeoutException: continue
-                    except Exception:
-                        finished.set()
-                        break
-                    if not isinstance(message, str): continue
-                    data = json.loads(message)
-                    if data.get("code", 0) != 0:
-                        self.events.put(("status", f"腾讯云错误：{data.get('message', data['code'])}"))
-                        finished.set()
-                        self.stop_event.set()
-                        break
-                    if data.get("final") == 1:
-                        finished.set(); break
-                    result = data.get("result")
-                    if result:
-                        started = self.capture_started + result.get("start_time", 0) / 1000
-                        ended = self.capture_started + result.get("end_time", 0) / 1000
-                        kind = "final_pair" if result.get("sentence_end") else "pair"
-                        self.events.put((kind, started, ended, result.get("source_text", ""), result.get("target_text", ""), session_id))
-            listener = threading.Thread(target=receive, daemon=True)
-            listener.start()
-            while not finished.is_set() and (not self.stop_event.is_set() or not self.audio.empty()):
-                try: ws.send(self.audio.get(timeout=.3), opcode=websocket.ABNF.OPCODE_BINARY)
-                except queue.Empty: continue
-            try: ws.send(json.dumps({"type":"end"}))
-            except Exception: pass
-            listener.join(timeout=4)
-            finished.set()
-        except Exception as exc:
-            self.events.put(("status", f"腾讯云连接失败：{type(exc).__name__}"))
-        finally:
-            if ws: ws.close()
-            self.events.put(("stopped",))
-
     def poll(self):
         try:
             while True:
@@ -701,7 +620,6 @@ class Interpreter(tk.Tk):
                     if self.stream: self.stream.stop(); self.stream.close(); self.stream = None
                     if self.session_id is not None: self.history_store.end(self.session_id)
                     self.start_button.set_label("● 开始", "#c8d3f6")
-                    self.mode_combo.configure(state="readonly")
                     self.device_combo.configure(state="readonly")
         except queue.Empty: pass
         self.after(80, self.poll)
