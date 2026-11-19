@@ -46,6 +46,7 @@ class PauseDuringUploadTests(unittest.TestCase):
                 self.assertTrue(check())
             try:
                 app.toggle()
+                wait_for(lambda: app.recording)
                 run = app.current_run
                 sid = run.session_id
                 silence = bytes(2*SAMPLE_RATE)
@@ -64,7 +65,7 @@ class PauseDuringUploadTests(unittest.TestCase):
                 self.assertIn("已暂停",app.status.get())
                 self.assertIsNotNone(db.session(sid)[2])
                 app.orb.invoke()
-                self.assertTrue(app.recording)
+                wait_for(lambda: app.recording)
                 self.assertIsNone(db.session(sid)[2])
                 later = app.current_run
                 self.assertIsNot(run, later)
@@ -83,9 +84,9 @@ class PauseDuringUploadTests(unittest.TestCase):
                                    int(app.tk.splitlist(app.transcript.tag_cget("original","font"))[1]))
             finally:
                 release.set()
-                if app.recording:
+                if app.recording or app.start_request is not None:
                     app.toggle()
-                wait_for(lambda: not app.pending_runs)
+                wait_for(lambda: not app.pending_runs and app.start_request is None)
                 for callback in app.tk.splitlist(app.tk.call("after", "info")):
                     app.after_cancel(callback)
                 app.destroy()

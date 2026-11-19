@@ -8,6 +8,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -27,6 +28,10 @@ MUTED = "#657490"
 ACCENT = "#6278AC"
 SELECT = "#DDE6F8"
 BORDER = "#DEE5F2"
+SCROLL_TRACK = "#E6ECF7"
+SCROLL_THUMB = "#788FBE"
+SCROLL_HOVER = "#536D9E"
+ROW_HOVER = "#E4EBF8"
 FONT = "Microsoft YaHei UI"
 ASSETS = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 
@@ -231,6 +236,16 @@ class RecordingRun:
             self.events.put(("finished",))
 
 
+@dataclass
+class CaptureStart:
+    sid: int | None
+    project_id: int | None
+    title: str
+    realtime: bool
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    result: queue.SimpleQueue = field(default_factory=queue.SimpleQueue)
+
+
 class InterpreterWindow(ctk.CTk):
 
     def __init__(self, history_store=None):
@@ -254,19 +269,23 @@ class InterpreterWindow(ctk.CTk):
         self.recording = self.closing = False
         self.panel = None
         self.expanded_projects = set()
-        self.archive_open = False
         self.recent_open = True
-        self.history_action = None
-        self.project_form = None
-        self.project_name = ctk.StringVar(value="")
+        self.row_menu = self.menu_anchor = None
+        self.menu_key = None
+        self.menu_row_updates = {}
+        self.history_rows = {}
+        self.session_sections = {}
+        self.archive_rows = {}
+        self.archive_row_updates = {}
         self.draft_project = None
-        self.settings_page = self.export_page = None
+        self.settings_page = self.export_page = self.archive_page = None
         self.export_results = queue.Queue()
         self.exporting_project = False
         self.desktop_folder = desktop_folder()
         self.export_folder = ctk.StringVar(value=str(self.desktop_folder))
         self.zoom = 1.
         self.stream = None
+        self.start_request = None
         self.current_run = None
         self.pending_runs = []
         self.partial = ("", "")
@@ -280,7 +299,7 @@ class InterpreterWindow(ctk.CTk):
         self.wave = wave_image()
         self.folder_icons = (project_icon(), project_icon(opened=True))
         self.sidebar_font = font(12)
-        self.sidebar_icons = {glyph: sidebar_glyph(glyph) for glyph in ("\ue70f", "\ue713", "\ue7b8")}
+        self.sidebar_icons = {glyph: sidebar_glyph(glyph) for glyph in ("\ue70f", "\ue713", "\ue7b8", "\ue8c8", "\ue710", "\ue896", "\ue74d", "\ue8b7", "\ue72b")}
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
         self.side = ctk.CTkFrame(self, width=224, corner_radius=0, fg_color=SIDE)
@@ -296,6 +315,9 @@ class InterpreterWindow(ctk.CTk):
         self.bind("<Control-MouseWheel>", self._zoom)
         self.set_panel("history")
         self.bind("<Escape>", self._escape)
+        self.bind("<Button-1>", self._outside_row_menu, add="+")
+        self.bind("<MouseWheel>", self._scroll_outside_row_menu, add="+")
+        self.bind("<Configure>", self._resize_row_menu, add="+")
         self.bind("<Control-b>", lambda _: self.toggle_history())
         self.after_idle(self.update_overlay)
         self.after(80, self.poll)
@@ -335,7 +357,9 @@ class InterpreterWindow(ctk.CTk):
         self.transcript = tk.Text(self.body, bg=PAPER, fg=INK, relief="flat", borderwidth=0,
                                   highlightthickness=0, wrap="word", padx=12, pady=8, cursor="arrow",
                                   selectbackground=SELECT, state="disabled", width=1, height=1)
-        self.scroll = ctk.CTkScrollbar(self.body, width=9, button_color=BORDER, button_hover_color="#BCCAE4",
+        self.scroll = ctk.CTkScrollbar(self.body, width=13, border_spacing=2,
+                                       fg_color=SCROLL_TRACK, button_color=SCROLL_THUMB,
+                                       button_hover_color=SCROLL_HOVER, minimum_pixel_length=28,
                                        command=self.transcript.yview)
         self.transcript.configure(yscrollcommand=self.scroll.set)
         self._size_fonts()
@@ -377,10 +401,17 @@ class InterpreterWindow(ctk.CTk):
 
     def _dock_state(self):
         text = "点击头像暂停" if self.recording else "点击头像继续" if self.view_id else "点击头像录制"
+        starting = self.start_request is not None and not self.start_request.cancelled.is_set()
+        if self.start_request is not None:
+            text = "再次点击可取消" if starting else "正在取消启动"
         self.action.configure(text=text)
-        self.orb.set_state(self.recording, not self.closing)
+        active = self.recording or starting
+        self.orb.set_state(active, not self.closing)
         if self.overlay is not None:
-            self.float_canvas.set_state(self.recording, not self.closing)
+            self.float_canvas.set_state(active, not self.closing)
+        if self.settings_page is not None:
+            for menu in self.options:
+                menu.configure(state="disabled" if self.recording or self.start_request else "normal")
         if self.recording and self.view_id != self.session_id:
             self.action.pack_forget()
             self.live_link.pack(side="left")
@@ -420,12 +451,13 @@ class InterpreterWindow(ctk.CTk):
         def click():
             if self.closing:
                 return
+            was_recording = self.recording
             self.toggle()
-            if not self.recording:
+            if was_recording:
                 self.deiconify()
                 self.lift()
         self.float_canvas = RecordOrb(win, self.orbs, scale, chroma, click, move_to)
-        self.float_canvas.set_state(self.recording, not self.closing)
+        self.float_canvas.set_state(self.recording or self.start_request is not None, not self.closing)
         self.float_canvas.pack()
         x, y = self.ball_position or default_orb_position(self, size, scale)
         win.geometry(f"{size}x{size}+{x}+{y}")
@@ -436,8 +468,8 @@ class InterpreterWindow(ctk.CTk):
             self.close_settings()
             return
         self.close_export()
-        if self.history_action or self.project_form:
-            self._dismiss_history_action()
+        self.close_archive()
+        self._close_row_menu()
         self.settings_page = ctk.CTkFrame(self.main, corner_radius=0, fg_color=PAPER)
         self.settings_page.grid(row=0, column=0, rowspan=2, sticky="nsew")
         self.settings_page.lift()
@@ -449,12 +481,14 @@ class InterpreterWindow(ctk.CTk):
             self.settings_page = self.settings_tab = None
 
     def _escape(self, _event):
-        if self.project_form or self.history_action:
-            self._dismiss_history_action()
+        if self.row_menu is not None:
+            self._close_row_menu()
         elif self.settings_page is not None:
             self.close_settings()
         elif self.export_page is not None:
             self.close_export()
+        elif self.archive_page is not None:
+            self.close_archive()
         else:
             self.set_panel(None)
         return "break"
@@ -464,6 +498,8 @@ class InterpreterWindow(ctk.CTk):
             self.close_export()
         elif self.view_id is not None:
             self.close_settings()
+            self.close_archive()
+            self._close_row_menu()
             page = self.export_page = ctk.CTkFrame(self.main, corner_radius=0, fg_color=PAPER)
             page.grid(row=0, column=0, rowspan=2, sticky="nsew")
             page.lift()
@@ -498,7 +534,10 @@ class InterpreterWindow(ctk.CTk):
 
     def set_panel(self, name):
         self.panel = name
-        self.history_action = self.project_form = None
+        self._close_row_menu()
+        self.history_rows.clear()
+        self.session_sections.clear()
+        self.menu_row_updates.clear()
         for child in self.side.winfo_children():
             child.destroy()
         if name is None:
@@ -547,169 +586,301 @@ class InterpreterWindow(ctk.CTk):
     def _history_list(self):
         if self.panel != "history":
             return
+        self._close_row_menu()
         canvas = self.listing._parent_canvas
         position = canvas.yview()[0]
         for child in self.listing.winfo_children():
             child.destroy()
-        self.history_rows = {}
+        self.history_rows.clear()
+        self.session_sections.clear()
+        self.menu_row_updates.clear()
         projects = dict(self.history_store.projects())
-        recent, archived, project_sessions = [], [], {}
-        for sid, started, title, pid, is_archived in self.history_store.library_sessions():
-            item = sid, title or datetime.fromtimestamp(started).strftime("%m.%d %H:%M"), pid
-            if is_archived:
-                archived.append(item)
-            elif pid is None:
-                recent.append(item)
-            else:
-                project_sessions.setdefault(pid, []).append(item)
+        grouped = {}
+        for sid, started, title, pid, archived in self.history_store.library_sessions():
+            if not archived:
+                grouped.setdefault(pid, []).append((sid, started, title))
 
         heading = ctk.CTkFrame(self.listing, fg_color="transparent")
         heading.pack(fill="x", pady=(3, 0))
         label(heading, "项目", 11, MUTED, bold=True).pack(side="left", padx=7)
-        button(heading, "创建项目", lambda: self._open_project_form(None), 60).pack(side="right")
-        if self.project_form == ("new", None):
-            self._draw_project_form(self.listing, None)
+        add = button(heading, "创建项目", lambda: self._project_form(add), 60)
+        add.pack(side="right")
         for pid, name in projects.items():
             opened = pid in self.expanded_projects
-            key = ("project", pid)
-            self._history_row(key, name, lambda n=pid: self._toggle_project(n), icon=self.folder_icons[opened],
-                              selected=self.view_id is None and self.draft_project == pid)
-            if self.history_action == (key, "menu"):
-                self._history_menu([
-                    ("在此新建会话", lambda n=pid: self.new_session(n)),
-                    ("导出项目 ZIP", lambda n=pid: self._export_project(n)),
-                ])
+            self._history_row(
+                self.listing, ("project", pid), name, lambda n=pid: self._toggle_project(n),
+                lambda row, n=pid: self._project_menu(row, n),
+                lambda row, n=pid, title=name: self._project_form(row, pid=n, name=title),
+                icon=self.folder_icons[opened],
+            )
             if opened:
-                for sid, title, _ in project_sessions.get(pid, ()):
-                    self._session_row(sid, title, pid, projects, indent=18)
-                if pid not in project_sessions:
-                    label(self.listing, "暂无会话", 11, MUTED).pack(anchor="w", padx=24, pady=3)
-
-        if self.archive_open:
-            archive_header = self._sidebar_button(self.listing, "⌄  已归档", self._toggle_archive)
-            archive_header.pack(fill="x", pady=(8, 0))
-            self.history_rows["archive"] = archive_header
-            for sid, title, pid in archived:
-                self._session_row(sid, title, pid, projects, indent=12, archived=True)
-            if not archived:
-                label(self.listing, "暂无归档", 11, MUTED).pack(anchor="w", padx=16, pady=3)
+                self._session_section(pid, grouped.get(pid, []))
 
         self._sidebar_button(self.listing, ("⌄" if self.recent_open else "›") + "  最近会话",
                              self._toggle_recent).pack(fill="x", pady=(8, 0))
         if self.recent_open:
-            for sid, title, _ in recent:
-                self._session_row(sid, title, None, projects)
-            if not recent:
-                label(self.listing, "暂无会话", 11, MUTED).pack(anchor="w", padx=10, pady=3)
+            self._session_section(None, grouped.get(None, []))
         self.listing.update_idletasks()
         canvas.yview_moveto(position)
 
-    def _history_row(self, key, title, command, *, icon=None, selected=False, indent=0):
-        card = ctk.CTkFrame(self.listing, fg_color=SELECT if selected else "transparent", corner_radius=8)
-        card.pack(fill="x", padx=(indent, 0), pady=1)
-        self.history_rows[key] = card
-        more = button(card, "⋯", lambda: self._show_history_action(key, "menu"), 25)
-        more.configure(height=28, border_spacing=0, text_color=SUB if selected or
-                       (self.history_action and self.history_action[0] == key) else SIDE)
-        if not selected and not (self.history_action and self.history_action[0] == key):
-            def hide(_event):
-                x, y = card.winfo_pointerxy()
-                left, top = card.winfo_rootx(), card.winfo_rooty()
-                if not (left <= x < left + card.winfo_width() and top <= y < top + card.winfo_height()):
-                    more.configure(text_color=SIDE)
+    def _session_section(self, pid, sessions):
+        section = ctk.CTkFrame(self.listing, fg_color="transparent")
+        section.pack(fill="x", padx=(18 if pid is not None else 0, 0))
+        empty = None
+        if not sessions:
+            empty = label(section, "暂无会话", 11, MUTED)
+            empty.pack(anchor="w", padx=10, pady=3)
+        self.session_sections[pid] = (section, empty)
+        for sid, started, title in sessions:
+            self._session_row(section, sid, started, title, pid)
 
-            card.bind("<Enter>", lambda _: more.configure(text_color=SUB), add="+")
-            card.bind("<Leave>", hide, add="+")
-            more.bind("<Enter>", lambda _: more.configure(text_color=SUB), add="+")
-            more.bind("<Leave>", hide, add="+")
-        more.pack(side="right", padx=(0, 2))
-        short = self._shorten_title(title, 135 - indent - (16 if icon else 0))
-        toggle = self._sidebar_button(card, short, command, icon, selected)
-        toggle.pack(side="left", fill="x", expand=True)
-        if not selected and not (self.history_action and self.history_action[0] == key):
-            toggle.bind("<Enter>", lambda _: more.configure(text_color=SUB), add="+")
-            toggle.bind("<Leave>", hide, add="+")
+    def _add_recording_row(self, sid, pid):
+        if self.panel != "history" or pid not in self.session_sections:
+            return
+        section, empty = self.session_sections[pid]
+        if empty is not None:
+            empty.destroy()
+            self.session_sections[pid] = (section, None)
+        before = section.pack_slaves()
+        _, started, _, _ = self.history_store.session(sid)
+        row = self._session_row(section, sid, started, self.history_store.title(sid), pid)
+        if before:
+            row.pack_configure(before=before[0])
 
-    def _session_row(self, sid, title, project, projects, *, indent=0, archived=False):
-        key = ("session", sid)
-        self._history_row(key, title, lambda: self.select_session(sid), selected=sid == self.view_id, indent=indent)
-        if self.project_form == ("new", sid):
-            self._draw_project_form(self.listing, sid)
-        if self.history_action == (key, "menu"):
-            self._history_menu([
-                ("重命名", lambda: self.rename_from_history(sid)),
-                ("移入项目  ›", lambda: self._show_history_action(key, "projects")),
-                ("导出 TXT", lambda: self._export_session(sid)),
-                ("恢复会话" if archived else "归档", lambda: self._archive(sid, not archived)),
-                ("删除", lambda: self.confirm_delete(sid)),
-            ])
-        elif self.history_action == (key, "projects"):
-            actions = [(self._shorten_title(name, 130), lambda n=pid: self._move(sid, n))
-                       for pid, name in projects.items() if pid != project]
-            actions.append(("创建项目并移入", lambda: self._open_project_form(sid)))
-            if project is not None:
-                actions.append(("移出当前项目", lambda: self._move(sid, None)))
-            actions.append(("‹  返回", lambda: self._show_history_action(key, "menu")))
-            self._history_menu(actions)
-        elif self.history_action == (key, "delete"):
-            self._history_menu([("确认删除", lambda: self.delete_session(sid)), ("取消", self._dismiss_history_action)])
+    def _row_selected(self, key):
+        kind, identifier = key
+        return self.view_id == identifier if kind == "session" else (
+            self.view_id is None and self.draft_project == identifier)
 
-    def _history_menu(self, actions):
-        menu = ctk.CTkFrame(self.listing, fg_color=PAPER, border_width=1, border_color=BORDER, corner_radius=8)
-        menu.pack(fill="x", padx=(12, 4), pady=(0, 3))
-        label_color = {"删除": "#A24460", "确认删除": "#A24460"}
-        for text, command in actions:
-            control = self._sidebar_button(menu, text, command)
-            if text in label_color:
-                control.configure(text_color=label_color[text])
-            control.pack(fill="x", padx=3, pady=1)
-        self._reveal_sidebar_widget(menu)
+    def _history_row(self, parent, key, title, command, menu_command, edit_command, *, icon=None, archive=False):
+        background = PAPER if archive else SIDE
+        card = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=9)
+        card.pack(fill="x", pady=1)
+        (self.archive_rows if archive else self.history_rows)[key] = card
+        short = title if archive else self._shorten_title(title, 112 - (18 if icon else 0))
+        primary = self._sidebar_button(card, short, command, icon)
+        primary.configure(height=30, hover=False)
+        primary.pack(side="left", fill="x", expand=True, padx=(1, 54))
+        actions = ctk.CTkFrame(card, fg_color="transparent")
+        more = button(actions, "⋯", lambda: menu_command(card), 25)
+        more.configure(height=25, border_spacing=0)
+        more.pack(side="left")
+        edit = button(actions, "", lambda: edit_command(card), 25)
+        edit.configure(image=self.sidebar_icons["\ue70f"], height=25, border_spacing=0)
+        edit.pack(side="left", padx=(0, 2))
 
-    def _reveal_sidebar_widget(self, widget):
-        def reveal():
-            if not widget.winfo_exists():
+        shown = None
+        hovered = False
+
+        def refresh():
+            nonlocal shown
+            active = self.menu_anchor is card
+            selected = self._row_selected(key)
+            state = selected, hovered, active
+            if shown == state:
                 return
-            canvas = self.listing._parent_canvas
-            region = canvas.bbox("all")
-            if not region or not canvas.winfo_viewable():
-                return
-            height = canvas.winfo_height()
-            top = widget.winfo_rooty() - canvas.winfo_rooty()
-            if top < 0:
-                shift = top
+            shown = state
+            card.configure(fg_color=SELECT if selected else ROW_HOVER if hovered or active else background)
+            if selected or hovered or active:
+                actions.place(relx=1, rely=.5, anchor="e")
             else:
-                shift = min(top, max(0, top + widget.winfo_height() - height))
-            if shift:
-                canvas.yview_moveto((canvas.canvasy(0) + shift) / max(1, region[3]))
-        self.after_idle(reveal)
+                actions.place_forget()
 
-    def _show_history_action(self, key, action):
-        self.project_form = None
-        state = (key, action)
-        self.history_action = None if self.history_action == state else state
-        self._history_list()
+        def enter(_event):
+            nonlocal hovered
+            hovered = True
+            refresh()
 
-    def _dismiss_history_action(self):
-        self.history_action = self.project_form = None
-        self._history_list()
+        def leave(_event):
+            nonlocal hovered
+            x, y = card.winfo_pointerxy()
+            left, top = card.winfo_rootx(), card.winfo_rooty()
+            if not (left <= x < left + card.winfo_width() and top <= y < top + card.winfo_height()):
+                hovered = False
+                refresh()
+
+        for widget in (card, primary, actions, more, edit):
+            widget.bind("<Enter>", enter, add="+")
+            widget.bind("<Leave>", leave, add="+")
+            widget.bind("<Button-3>", lambda _: menu_command(card), add="+")
+        (self.archive_row_updates if archive else self.menu_row_updates)[key] = refresh
+        refresh()
+        return card
+
+    def _session_row(self, parent, sid, started, title, project, *, archived=False):
+        return self._history_row(
+            parent, ("session", sid), title or datetime.fromtimestamp(started).strftime("%m.%d %H:%M"),
+            lambda: self.select_session(sid),
+            lambda row: self._session_menu(row, sid, project, archived),
+            lambda _row: self.rename_from_history(sid), archive=archived,
+        )
+
+    def _project_menu(self, row, pid):
+        self._show_row_menu(row, ("project", pid), [
+            ("在此新建会话", "\ue710", lambda: self.new_session(pid)),
+            ("导出项目 ZIP", "\ue896", lambda: self._export_from_menu(pid)),
+        ])
+
+    def _export_from_menu(self, pid):
+        self._close_row_menu()
+        self._export_project(pid)
+
+    def _session_menu(self, row, sid, pid, archived):
+        self._show_row_menu(row, ("session", sid), [
+            ("重命名", "\ue70f", lambda: self.rename_from_history(sid)),
+            ("移入项目   ›", "\ue8b7", lambda: self._move_menu(row, sid, pid, archived)),
+            ("导出 TXT", "\ue896", lambda: self._export_session(sid)),
+            ("恢复会话" if archived else "归档", "\ue7b8", lambda: self._archive(sid, not archived)),
+            ("删除", "\ue74d", lambda: self.confirm_delete(row, sid)),
+        ])
+
+    def _move_menu(self, row, sid, current, archived):
+        choices = [(self._shorten_title(name, 126), "\ue8b7", lambda n=pid: self._move(sid, n))
+                   for pid, name in self.history_store.projects() if pid != current]
+        self._show_row_menu(row, ("move", sid), [
+            ("返回", "\ue72b", lambda: self._session_menu(row, sid, current, archived)),
+            ("创建项目并移入", "\ue710", lambda: self._project_form(row, sid=sid)),
+            *([("移出当前项目", "\ue8b7", lambda: self._move(sid, None))] if current is not None else []),
+            *choices,
+        ])
+
+    def _make_row_menu(self, anchor, key):
+        self._close_row_menu()
+        menu = self.row_menu = ctk.CTkFrame(self, fg_color="#FFFFFF", bg_color=PAPER, border_width=1,
+                                           border_color="#D5DFF0", corner_radius=10)
+        self.menu_anchor, self.menu_key = anchor, key
+        self._refresh_row_selection()
+        return menu
+
+    def _show_row_menu(self, anchor, key, actions):
+        if self.menu_anchor is anchor and self.menu_key == key:
+            self._close_row_menu()
+            return
+        menu = self._make_row_menu(anchor, key)
+        body = menu
+        if len(actions) > 6:
+            body = ctk.CTkScrollableFrame(menu, width=160, height=176, fg_color="transparent",
+                                          scrollbar_button_color=SCROLL_THUMB)
+            body.pack(fill="both", padx=4, pady=4)
+        for text, icon, command in actions:
+            control = self._sidebar_button(body, text, command, icon)
+            if text in ("删除", "确认删除"):
+                control.configure(text_color="#A24460")
+            control.configure(width=158, height=30, hover_color="#EDF2FA", corner_radius=6)
+            control.pack(fill="x", padx=5, pady=(2, 1))
+        self._position_row_menu()
+
+    def _position_row_menu(self):
+        menu, row = self.row_menu, self.menu_anchor
+        if menu is None or not row.winfo_viewable():
+            return
+        menu.update_idletasks()
+        if self.row_menu is not menu:
+            return
+        width, height = menu.winfo_reqwidth(), menu.winfo_reqheight()
+        x = row.winfo_rootx() - self.winfo_rootx() + row.winfo_width()
+        top = row.winfo_rooty() - self.winfo_rooty()
+        bottom = top + row.winfo_height()
+        right = self.winfo_width() - width - 7
+        y = top if x <= right else (bottom if bottom + height <= self.winfo_height() else top - height)
+        x = max(6, min(x + 4, right))
+        y = max(6, min(y, self.winfo_height() - height - 6))
+        scale = menu._get_widget_scaling()
+        menu.place(x=x / scale, y=y / scale)
+        menu.lift()
+
+    def _close_row_menu(self):
+        if self.row_menu is not None:
+            menu = self.row_menu
+            self.row_menu = self.menu_anchor = self.menu_key = None
+            menu.destroy()
+            self._refresh_row_selection()
+
+    def _refresh_row_selection(self):
+        for rows in (self.menu_row_updates, self.archive_row_updates):
+            for refresh in rows.values():
+                refresh()
+
+    @staticmethod
+    def _within(widget, parent):
+        return parent is not None and (widget == parent or str(widget).startswith(str(parent) + "."))
+
+    def _outside_row_menu(self, event):
+        if self.row_menu is None or not event.widget.winfo_exists():
+            return
+        if not (self._within(event.widget, self.row_menu) or self._within(event.widget, self.menu_anchor)):
+            self._close_row_menu()
+
+    def _scroll_outside_row_menu(self, event):
+        if self.row_menu is not None and not self._within(event.widget, self.row_menu):
+            self._close_row_menu()
+
+    def _resize_row_menu(self, event):
+        if event.widget is self and self.row_menu is not None:
+            self._close_row_menu()
 
     def _toggle_project(self, pid):
         self.expanded_projects.symmetric_difference_update({pid})
-        self._dismiss_history_action()
+        self._history_list()
 
     def _toggle_recent(self):
         self.recent_open = not self.recent_open
-        self._dismiss_history_action()
+        self._history_list()
 
     def _toggle_archive(self):
-        self.archive_open = not self.archive_open
-        self._dismiss_history_action()
-        if self.archive_open:
-            self._reveal_sidebar_widget(self.history_rows["archive"])
+        if self.archive_page is not None:
+            self.close_archive()
+            return
+        self.close_settings()
+        self.close_export()
+        self._close_row_menu()
+        page = self.archive_page = ctk.CTkFrame(self.main, corner_radius=0, fg_color=PAPER)
+        page.grid(row=0, column=0, rowspan=2, sticky="nsew")
+        page.lift()
+        header = ctk.CTkFrame(page, fg_color="transparent")
+        header.pack(fill="x", padx=18, pady=(9, 4))
+        self._page_heading(header, "已归档", self.close_archive)
+        self.archive_list = ctk.CTkScrollableFrame(page, fg_color="transparent",
+                                                  scrollbar_fg_color=SCROLL_TRACK, scrollbar_button_color=SCROLL_THUMB,
+                                                  scrollbar_button_hover_color=SCROLL_HOVER)
+        self.archive_list.pack(fill="both", expand=True, padx=(18, 12), pady=(2, 8))
+        archive_scroll = self.archive_list._scrollbar
+        def update_scroll(first, last):
+            archive_scroll.set(first, last)
+            if float(first) <= 0.0 and float(last) >= 1.0:
+                archive_scroll.grid_remove()
+            else:
+                archive_scroll.grid()
+        self.archive_list._parent_canvas.configure(yscrollcommand=update_scroll)
+        self._draw_archive()
+
+    def _draw_archive(self):
+        if self.archive_page is None:
+            return
+        self.archive_rows.clear()
+        self.archive_row_updates.clear()
+        for child in self.archive_list.winfo_children():
+            child.destroy()
+        archived = [(sid, started, title, pid) for sid, started, title, pid, is_archived
+                    in self.history_store.library_sessions() if is_archived]
+        if not archived:
+            label(self.archive_list, "暂无归档会话", 12, MUTED).pack(anchor="w", padx=6, pady=12)
+        for sid, started, title, pid in archived:
+            self._session_row(self.archive_list, sid, started, title, pid, archived=True)
+
+    def close_archive(self):
+        if self.archive_page is not None:
+            self._close_row_menu()
+            self.archive_page.destroy()
+            self.archive_page = None
+            self.archive_rows.clear()
+            self.archive_row_updates.clear()
 
     def _archive(self, sid, archive):
         self.history_store.archive_session(sid, archive)
-        self._dismiss_history_action()
+        self._close_row_menu()
+        self._history_list()
+        self._draw_archive()
         self.status.set("会话已归档" if archive else "会话已恢复")
 
     def _move(self, sid, pid):
@@ -718,49 +889,48 @@ class InterpreterWindow(ctk.CTk):
             self.expanded_projects.add(pid)
         else:
             self.recent_open = True
-        self._dismiss_history_action()
-        target = self.history_rows.get(("session", sid))
-        if target is not None:
-            self._reveal_sidebar_widget(target)
+        self._close_row_menu()
+        self._history_list()
+        self._draw_archive()
         self.status.set("已移入项目" if pid is not None else "已移出项目")
 
-    def _open_project_form(self, sid):
-        self.project_name.set("")
-        self.history_action = None
-        self.project_form = ("new", sid)
-        self._history_list()
-        self.project_entry.focus_set()
-
-    def _draw_project_form(self, parent, sid):
-        form = ctk.CTkFrame(parent, fg_color=PAPER, border_width=1, border_color=BORDER)
-        form.pack(fill="x", padx=3, pady=4)
-        entry = self.project_entry = ctk.CTkEntry(form, textvariable=self.project_name,
-                                                 fg_color="white", border_color=BORDER)
-        label(form, "项目名称", 11, MUTED).pack(anchor="w", padx=8, pady=(5, 0))
-        entry.pack(fill="x", padx=6, pady=4)
+    def _project_form(self, anchor, *, sid=None, pid=None, name=""):
+        form = self._make_row_menu(anchor, ("project-form", pid or sid))
+        label(form, "项目名称", 11, MUTED).pack(anchor="w", padx=10, pady=(8, 2))
+        entry = ctk.CTkEntry(form, width=177, fg_color="white", border_color=BORDER)
+        entry.insert(0, name)
+        entry.pack(fill="x", padx=8, pady=4)
+        feedback = label(form, "", 10, "#A24460")
+        feedback.pack(anchor="w", padx=8)
 
         def save():
             try:
-                pid = self.history_store.create_project(self.project_name.get())
+                if pid is None:
+                    project = self.history_store.create_project(entry.get())
+                else:
+                    self.history_store.rename_project(pid, entry.get())
+                    project = pid
             except ValueError as exc:
                 feedback.configure(text=str(exc))
+                self._position_row_menu()
                 return
             if sid is not None:
-                self._move(sid, pid)
-            else:
-                self.expanded_projects.add(pid)
-                self._dismiss_history_action()
-                self._reveal_sidebar_widget(self.history_rows[("project", pid)])
-                self.status.set("项目已创建")
+                self._move(sid, project)
+                return
+            self._close_row_menu()
+            if pid is None:
+                self.expanded_projects.add(project)
+            self._history_list()
+            self.status.set("项目已创建" if pid is None else "项目名称已保存")
 
         entry.bind("<Return>", lambda _: save())
-        feedback = label(form, "", 10, "#A24460")
-        feedback.pack(anchor="w", padx=6)
         controls = ctk.CTkFrame(form, fg_color="transparent")
-        controls.pack(fill="x", padx=4, pady=(0, 4))
-        button(controls, "取消", self._dismiss_history_action, 38).pack(side="right")
-        button(controls, "创建并移入" if sid is not None else "创建", save, 60, fill=SELECT).pack(side="right", padx=3)
-        self._reveal_sidebar_widget(form)
+        controls.pack(fill="x", padx=6, pady=(0, 6))
+        button(controls, "保存" if pid is not None else "创建", save, 52, fill=SELECT).pack(side="right")
+        button(controls, "取消", self._close_row_menu, 38).pack(side="right", padx=3)
+        self._position_row_menu()
+        entry.focus_set()
+        entry.select_range(0, "end")
 
     def _export_project(self, pid):
         if self.exporting_project:
@@ -820,17 +990,24 @@ class InterpreterWindow(ctk.CTk):
         self._history_list()
         self.status.set("名称已保存")
 
-    def confirm_delete(self, sid):
-        if any(run.session_id == sid for run in self.pending_runs):
+    def _session_in_use(self, sid):
+        return any(run.session_id == sid for run in self.pending_runs) or (
+            self.start_request is not None and self.start_request.sid == sid)
+
+    def confirm_delete(self, row, sid):
+        if self._session_in_use(sid):
             self.status.set("请等这段录制结束并保存后再删除")
             return
-        self._show_history_action(("session", sid), "delete")
+        self._show_row_menu(row, ("delete", sid), [
+            ("确认删除", "\ue74d", lambda: self.delete_session(sid)),
+            ("取消", "\ue72b", self._close_row_menu),
+        ])
 
     def delete_session(self, sid):
-        if any(run.session_id == sid for run in self.pending_runs):
+        if self._session_in_use(sid):
             return
+        self._close_row_menu()
         self.history_store.delete_session(sid)
-        self.history_action = None
         if self.session_id == sid:
             self.session_id = None
         if self.view_id == sid:
@@ -838,8 +1015,8 @@ class InterpreterWindow(ctk.CTk):
             self.draft_project = None
             self.close_export()
             self._select(self.session_id)
-        else:
-            self._history_list()
+        self._history_list()
+        self._draw_archive()
         self.status.set("会话已删除")
 
     def _settings(self, page):
@@ -877,7 +1054,7 @@ class InterpreterWindow(ctk.CTk):
             menu = ctk.CTkOptionMenu(recording, variable=var, values=values, width=110, dynamic_resizing=False,
                                      fg_color="white", button_color="#DCE5F6", button_hover_color=SELECT,
                                      text_color=INK, dropdown_fg_color=PAPER, dropdown_text_color=INK,
-                                     state="disabled" if self.recording else "normal", font=font(12))
+                                     state="disabled" if self.recording or self.start_request else "normal", font=font(12))
             menu.pack(fill="x", padx=3, pady=(0, 4))
             self.options.append(menu)
 
@@ -957,7 +1134,7 @@ class InterpreterWindow(ctk.CTk):
         self.close_settings()
         self.status.set("设置已保存")
 
-    def _select(self, sid, *, update_sidebar=True):
+    def _select(self, sid):
         self.cancel_title()
         self.view_id = sid
         self._header_state()
@@ -980,8 +1157,7 @@ class InterpreterWindow(ctk.CTk):
                                       "原文与译文将在这里逐段显示" if sid is None else "这段会话还没有已保存的内容")
             self.empty.place(relx=.5, rely=.48, anchor="center")
         self.transcript.yview_moveto(1. if sid == self.session_id else 0.)
-        if update_sidebar:
-            self._history_list()
+        self._refresh_row_selection()
         self._dock_state()
 
     def _header_state(self):
@@ -1026,18 +1202,20 @@ class InterpreterWindow(ctk.CTk):
     def select_session(self, sid):
         self.close_settings()
         self.close_export()
-        self.history_action = self.project_form = None
+        self.close_archive()
+        self._close_row_menu()
         self.status.set("")
         self._select(sid)
 
     def new_session(self, project_id=None):
-        if self.recording:
-            self.status.set("请先点击头像暂停当前录制")
+        if self.recording or self.start_request is not None:
+            self.status.set("请先点击头像暂停录制或取消启动")
             return
         self.session_id = None
         self.draft_project = project_id
-        if project_id is not None:
+        if project_id is not None and project_id not in self.expanded_projects:
             self.expanded_projects.add(project_id)
+            self._history_list()
         self.draft_title = ""
         self.select_session(None)
 
@@ -1070,37 +1248,91 @@ class InterpreterWindow(ctk.CTk):
         if self.recording:
             self._pause_capture()
             return
+        if self.start_request is not None:
+            self.start_request.cancelled.set()
+            self.status.set("正在取消启动…")
+            self._dock_state()
+            return
+
+        device = self.devices.get(self.device.get())
+        if device is None:
+            self._start_failed("请选择可用的麦克风", "录制")
+            return
         realtime = self.mode.get() == "腾讯云 实时"
-        candidates = ["腾讯云"] if realtime else self.priority
+        request = self.start_request = CaptureStart(self.view_id, self.draft_project, self.draft_title, realtime)
+        self.status.set("正在启动麦克风…")
+        self._dock_state()
+        candidates = ["腾讯云"] if realtime else list(self.priority)
+        threading.Thread(target=self._open_capture, args=(request, candidates, device),
+                         name="microphone-start", daemon=True).start()
+        self.after(25, self._finish_capture_start)
+
+    def _open_capture(self, request, candidates, device):
+        stream = None
         try:
             keys = {key: keyring.get_password(SERVICE, key) for name in candidates for key in KEYS[name]}
-            routes = [name for name in candidates if all(keys[key] for key in KEYS[name])]
-            missing = not routes
         except Exception:
-            self.status.set("无法读取 Windows 凭据，请检查设置")
+            request.result.put((None, None, "无法读取 Windows 凭据，请检查设置", "翻译服务"))
             return
-        if missing or self.device.get() not in self.devices:
-            self.status.set("请在「翻译服务」填写密钥" if missing else "请选择可用的麦克风")
-            if self.settings_page is None:
-                self.toggle_settings()
-            self.settings_tab("翻译服务" if missing else "录制")
+        routes = [name for name in candidates if all(keys[key] for key in KEYS[name])]
+        if not routes:
+            request.result.put((None, None, "请在「翻译服务」填写密钥", "翻译服务"))
+            return
+        if request.cancelled.is_set():
+            request.result.put((None, None, None, None))
             return
         run = RecordingRun(self.history_store, keys, routes)
         try:
-            self.stream = sd.RawInputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
-                                           blocksize=FRAME_SAMPLES, device=self.devices[self.device.get()], callback=run.capture)
+            stream = sd.RawInputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
+                                       blocksize=FRAME_SAMPLES, device=device, callback=run.capture)
+            if request.cancelled.is_set():
+                stream.close()
+                request.result.put((None, None, None, None))
+                return
             run.capture_started = time.time()
-            self.stream.start()
-            if self.view_id is None:
-                sid = self.history_store.begin(routes[0], self.draft_title or None, self.draft_project)
+            stream.start()
+        except Exception as exc:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            request.result.put((None, None, f"无法开始录制 · {exc}", None))
+            return
+        request.result.put((run, stream, None, None))
+
+    def _finish_capture_start(self):
+        request = self.start_request
+        try:
+            run, stream, error, tab = request.result.get_nowait()
+        except queue.Empty:
+            self.after(25, self._finish_capture_start)
+            return
+        self.start_request = None
+        self.stream = stream
+        if request.cancelled.is_set() or self.closing:
+            try:
+                self._close_stream()
+            finally:
+                self._dock_state()
+                self.status.set("已取消启动")
+            return
+        if error:
+            self._start_failed(error, tab)
+            return
+        sid = request.sid
+        new = sid is None
+        try:
+            if new:
+                sid = self.history_store.begin(run.active_routes[0], request.title or None, request.project_id)
                 self.draft_title = ""
             else:
-                sid = self.view_id
                 self.history_store.resume(sid)
         except Exception as exc:
             self._close_stream()
-            self.status.set(f"无法开始录制 · {exc}")
+            self._start_failed(f"无法保存会话 · {exc}")
             return
+
         run.session_id = sid
         prior = next((r for r in reversed(self.pending_runs) if r.session_id == sid), None)
         run.previous_saved = prior.saved if prior else None
@@ -1109,14 +1341,29 @@ class InterpreterWindow(ctk.CTk):
         self.session_id = sid
         self.recording = True
         self.partial = ("", "")
-        self.status.set("正在收音" if realtime else "正在收音 · 停顿 1 秒后翻译")
-        self._select(sid)
-        self.update_overlay()
-        if self.settings_page is not None:
-            for menu in self.options:
-                menu.configure(state="disabled")
-        backend = AudioBackend.tencent_loop if realtime else priority_loop
+        if new:
+            self._add_recording_row(sid, request.project_id)
+        self.status.set("正在收音" if request.realtime else "正在收音 · 停顿 1 秒后翻译")
+        if self.view_id == request.sid:
+            if new:
+                self._select(sid)
+            else:
+                self._header_state()
+                self.transcript.yview_moveto(1)
+                if not self.has_text:
+                    self.empty_title.configure(text="正在聆听")
+                    self.empty_hint.configure(text="识别到的原文和译文会逐段显示")
+        self._dock_state()
+        backend = AudioBackend.tencent_loop if request.realtime else priority_loop
         threading.Thread(target=run.process, args=(backend,), daemon=True).start()
+
+    def _start_failed(self, error, settings_tab=None):
+        self._dock_state()
+        self.status.set(error)
+        if settings_tab:
+            if self.settings_page is None:
+                self.toggle_settings()
+            self.settings_tab(settings_tab)
 
     def _pause_capture(self):
         run = self.current_run
@@ -1134,9 +1381,6 @@ class InterpreterWindow(ctk.CTk):
                 self.empty_title.configure(text="已暂停收音")
                 self.empty_hint.configure(text="收到的译文会保存在本次会话")
             self.status.set("已暂停收音 · 剩余译文在后台保存")
-            if self.settings_page is not None:
-                for menu in self.options:
-                    menu.configure(state="normal")
 
     def _close_stream(self):
         if self.stream is not None:
@@ -1175,7 +1419,7 @@ class InterpreterWindow(ctk.CTk):
             run.saved.set()  # Previous translations have reached SQLite before continuation.
             if not self.recording and self.view_id == sid:
                 self.partial = ("", "")
-                self._select(sid, update_sidebar=False)
+                self._select(sid)
                 self.status.set(run.failure or ("已暂停收音 · 剩余译文在后台保存" if self.pending_runs else "已暂停 · 已保存"))
 
     def poll(self):
@@ -1191,7 +1435,7 @@ class InterpreterWindow(ctk.CTk):
         if not self.export_results.empty():
             self.exporting_project = False
             self.status.set(self.export_results.get_nowait())
-        if self.closing and not self.pending_runs and not self.exporting_project:
+        if self.closing and not self.pending_runs and not self.exporting_project and self.start_request is None:
             self.destroy()
         else:
             self.after(80, self.poll)
@@ -1200,7 +1444,11 @@ class InterpreterWindow(ctk.CTk):
         self.closing = True
         if self.recording:
             self._pause_capture()
-        if self.pending_runs:
+        if self.start_request is not None:
+            self.start_request.cancelled.set()
+            self._dock_state()
+            self.status.set("正在关闭麦克风")
+        elif self.pending_runs:
             self._dock_state()
             self.status.set("已停止收音 · 完成剩余翻译后自动退出")
         elif self.exporting_project:

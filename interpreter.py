@@ -149,6 +149,16 @@ class HistoryStore:
             except sqlite3.IntegrityError as exc:
                 raise ValueError("已有同名项目") from exc
 
+    def rename_project(self, project_id, name):
+        name = name.strip()
+        if not 1 <= len(name) <= 80:
+            raise ValueError("项目名请输入 1 至 80 个字")
+        with self.connect() as db:
+            try:
+                db.execute("UPDATE projects SET name=? WHERE id=?", (name, project_id))
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("已有同名项目") from exc
+
     def move_session(self, sid, project_id):
         with self.connect() as db:
             db.execute("UPDATE sessions SET project_id=? WHERE id=?", (project_id,sid))
