@@ -68,6 +68,9 @@ class HistoryStore:
                     name TEXT PRIMARY KEY, value TEXT NOT NULL
                 );
             """)
+            project_columns = {row[1] for row in db.execute("PRAGMA table_info(projects)")}
+            if "archived" not in project_columns:
+                db.execute("ALTER TABLE projects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
             columns = {row[1] for row in db.execute("PRAGMA table_info(sessions)")}
             if "project_id" not in columns:
                 db.execute("ALTER TABLE sessions ADD COLUMN project_id INTEGER REFERENCES projects(id)")
@@ -135,9 +138,14 @@ class HistoryStore:
                 SELECT id,started,title,project_id,archived FROM sessions ORDER BY started DESC,id DESC
             """).fetchall()
 
-    def projects(self):
+    def projects(self, archived=None):
         with self.connect() as db:
-            return db.execute("SELECT id,name FROM projects ORDER BY name COLLATE NOCASE,id").fetchall()
+            return db.execute("""SELECT id,name FROM projects WHERE (? IS NULL OR archived=?)
+                ORDER BY name COLLATE NOCASE,id""", (archived, archived)).fetchall()
+
+    def archive_project(self, project_id, archived=True):
+        with self.connect() as db:
+            db.execute("UPDATE projects SET archived=? WHERE id=?", (int(archived), project_id))
 
     def create_project(self, name):
         name = name.strip()

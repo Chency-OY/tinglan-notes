@@ -48,3 +48,30 @@ class LibraryTests(unittest.TestCase):
             self.assertEqual(old,out.read_bytes()); self.assertFalse(list(Path(tmp).glob('*.tmp')))
             store.archive_session(12,False); self.assertIn(12,[r[0] for r in store.session_previews(a)])
             store.move_session(12,None); self.assertNotIn(12,[r[0] for r in store.session_previews(a)])
+
+
+    def test_migrated_project_archives_without_changing_session_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "history.sqlite3"
+            with sqlite3.connect(path) as old:
+                old.executescript("""
+                    CREATE TABLE projects(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE);
+                    INSERT INTO projects VALUES (9,'Class');
+                """)
+            old.close()
+            store = HistoryStore(path)
+            first = store.begin("test", project_id=9)
+            second = store.begin("test", project_id=9)
+            store.archive_session(second)
+            self.assertEqual(store.projects(archived=False), [(9, "Class")])
+
+            store.archive_project(9)
+            reopened = HistoryStore(path)
+            self.assertEqual(reopened.projects(archived=False), [])
+            self.assertEqual(reopened.projects(archived=True), [(9, "Class")])
+            self.assertEqual(reopened.project_zip(9, Path(tmp) / "class.zip"), 2)
+
+            reopened.archive_project(9, False)
+            self.assertEqual(reopened.projects(archived=False), [(9, "Class")])
+            self.assertEqual([row[0] for row in reopened.session_previews(9)], [first])
+            self.assertEqual([row[0] for row in reopened.session_previews(9, True)], [second])

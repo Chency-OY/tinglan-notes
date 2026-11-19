@@ -49,8 +49,10 @@ def desktop_folder() -> Path:
     return Path.home() / "Desktop"
 
 
-def default_orb_position(main, size, scale):
-    """Bottom-right of the main window's monitor work area, in Tk screen pixels."""
+def monitor_work_area(window, position=None):
+    """Return the nearest monitor's usable rectangle in screen pixels."""
+    if sys.platform != "win32":
+        return 0, 0, window.winfo_screenwidth(), window.winfo_screenheight()
     import ctypes
     from ctypes import wintypes
 
@@ -59,16 +61,38 @@ def default_orb_position(main, size, scale):
                     ("work", wintypes.RECT), ("flags", wintypes.DWORD)]
 
     user32 = ctypes.windll.user32
-    user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
-    user32.MonitorFromWindow.restype = wintypes.HANDLE
+    if position is None:
+        user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+        user32.MonitorFromWindow.restype = wintypes.HANDLE
+        monitor = user32.MonitorFromWindow(window.winfo_id(), 2)
+    else:
+        user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+        user32.MonitorFromPoint.restype = wintypes.HANDLE
+        monitor = user32.MonitorFromPoint(wintypes.POINT(*position), 2)
     user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
-    monitor = user32.MonitorFromWindow(main.winfo_id(), 2)
+    user32.GetMonitorInfoW.restype = wintypes.BOOL
     info = MonitorInfo()
     info.cbSize = ctypes.sizeof(info)
-    area = info.work if user32.GetMonitorInfoW(monitor, ctypes.byref(info)) else wintypes.RECT(
-        0, 0, main.winfo_screenwidth(), main.winfo_screenheight())
-    margin = round(12 * scale)
-    return max(area.left, area.right - size - margin), max(area.top, area.bottom - size - margin)
+    if user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        return info.work.left, info.work.top, info.work.right, info.work.bottom
+    return 0, 0, window.winfo_screenwidth(), window.winfo_screenheight()
+
+
+def move_overlay_window(window, x, y):
+    if sys.platform != "win32":
+        window.geometry(f"+{max(0, x)}+{max(0, y)}")
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetAncestor.restype = wintypes.HWND
+    user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    user32.SetWindowPos.restype = wintypes.BOOL
+    hwnd = user32.GetAncestor(window.winfo_id(), 2)
+    user32.SetWindowPos(hwnd, None, x, y, 0, 0, 0x0015)  # Keep size, stacking order and focus.
 
 
 def font(size, bold=False, family=FONT):
@@ -152,7 +176,7 @@ def project_icon(opened=False):
 class RecordOrb(tk.Canvas):
     """Only an unmoved short press can toggle. A drag stays a drag until release."""
 
-    def __init__(self, parent, orbs, scale, background, command, on_drag=None):
+    def __init__(self, parent, orbs, scale, background, command, on_drag=None, on_drop=None):
         size = round(60 * scale)
         super().__init__(parent, width=size, height=size, bg=background, borderwidth=0,
                          highlightthickness=0, takefocus=on_drag is None, cursor="hand2")
@@ -160,6 +184,7 @@ class RecordOrb(tk.Canvas):
         self.face = self.create_image(0, 0, anchor="nw", image=self.images[0])
         self.command = command
         self.on_drag = on_drag
+        self.on_drop = on_drop
         self.press_at = None
         self.enabled = True
         self.bind("<ButtonPress-1>", self._press)
@@ -181,8 +206,7 @@ class RecordOrb(tk.Canvas):
         self.down_time = time.monotonic()
         self.press_timestamp = event.time
         self.dragged = False
-        top = self.winfo_toplevel()
-        self.window_origin = (top.winfo_x(), top.winfo_y())
+        self.window_origin = (self.winfo_rootx(), self.winfo_rooty())
         self.grab_set()
 
     def _motion(self, event):
@@ -204,8 +228,79 @@ class RecordOrb(tk.Canvas):
         if self.grab_current() is self:
             self.grab_release()
         elapsed_ms = (event.time - self.press_timestamp) & 0xffffffff
-        if not self.dragged and elapsed_ms < 400 and time.monotonic() - self.down_time < .40:
+        if self.dragged:
+            if self.on_drop is not None:
+                self.on_drop()
+        elif elapsed_ms < 400 and time.monotonic() - self.down_time < .40:
             self.invoke()
+
+
+class OverlayTicker(ctk.CTkFrame):
+    """A single line that scrolls only when the latest translation does not fit."""
+
+    WIDTH = 316
+    HEIGHT = 29
+
+    def __init__(self, parent, chroma, scale, y):
+        fill = "#F0F4FC"
+        super().__init__(parent, width=self.WIDTH, height=self.HEIGHT, fg_color=fill, bg_color=chroma,
+                         border_width=1, border_color="#CFDBF3", corner_radius=10)
+        self.pack_propagate(False)
+        self.scale = scale
+        self.y = y / scale
+        padding = round(9 * scale)
+        self.inner_width = round(self.WIDTH * scale) - 2 * padding
+        height = round(20 * scale)
+        self.canvas = tk.Canvas(self, width=self.inner_width, height=height, bg=fill, borderwidth=0, highlightthickness=0)
+        self.canvas.pack(expand=True, padx=padding)
+        self.line = self.canvas.create_text(0, height // 2, anchor="w", fill=INK,
+                                            font=(FONT, -round(13 * scale)), text="")
+        self.text = ""
+        self.offset = 0.
+        self.travel = 0
+        self.timer = None
+
+    def _cancel_timer(self):
+        if self.timer is not None:
+            self.after_cancel(self.timer)
+            self.timer = None
+
+    def show(self, text):
+        text = " ".join(text.split())
+        if text == self.text:
+            return
+        self.text = text
+        self._cancel_timer()
+        if not text:
+            self.place_forget()
+            return
+        self.canvas.itemconfigure(self.line, text=text)
+        self.canvas.coords(self.line, 0, round(10 * self.scale))
+        left, _, right, _ = self.canvas.bbox(self.line)
+        length = right - left
+        self.travel = max(0, length - self.inner_width)
+        self.offset = 0.
+        self.place(x=0, y=self.y)
+        if self.travel:
+            self.speed = min(88 * self.scale, max(47 * self.scale, self.travel / 9))
+            self.timer = self.after(850, self._advance)
+        else:
+            self.canvas.move(self.line, (self.inner_width - length) / 2, 0)
+
+    def _advance(self):
+        self.timer = None
+        if self.offset >= self.travel:
+            self.offset = 0.
+            delay = 850
+        else:
+            self.offset = min(self.travel, self.offset + self.speed * .04)
+            delay = 1150 if self.offset == self.travel else 40
+        self.canvas.coords(self.line, -self.offset, round(10 * self.scale))
+        self.timer = self.after(delay, self._advance)
+
+    def destroy(self):
+        self._cancel_timer()
+        super().destroy()
 
 
 class RecordingRun:
@@ -255,15 +350,16 @@ class InterpreterWindow(ctk.CTk):
         self.iconbitmap(str(ASSETS / "icon.ico"))
         self.geometry("800x460")
         self.minsize(540, 300)
-        self.opacity = .94
         self.attributes("-topmost", False)
-        self.attributes("-alpha", self.opacity)
+        self.attributes("-alpha", 1.0)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.history_store = history_store or HistoryStore()
         self.priority = priority_order(self.history_store.preference("priority", "DeepSeek|Kimi 订阅|腾讯云"))
         self.float_enabled = ctk.BooleanVar(value=self.history_store.preference("overlay", "1") == "1")
-        self.overlay = None
-        self.ball_position = None
+        self.overlay = self.overlay_ticker = None
+        self.overlay_subtitle = ""
+        self.ball_position = self._load_ball_position()
+        self.overlay_alpha_percent = self._percent_preference("overlay_alpha", 90, 55, 100)
         self.draft_title = ""
         self.session_id = self.view_id = None
         self.recording = self.closing = False
@@ -278,12 +374,16 @@ class InterpreterWindow(ctk.CTk):
         self.archive_rows = {}
         self.archive_row_updates = {}
         self.draft_project = None
-        self.settings_page = self.export_page = self.archive_page = None
+        self.settings_page = self.export_page = self.archive_list = None
+        self.expanded_archived_projects = set()
         self.export_results = queue.Queue()
         self.exporting_project = False
         self.desktop_folder = desktop_folder()
         self.export_folder = ctk.StringVar(value=str(self.desktop_folder))
-        self.zoom = 1.
+        self.zoom_percent = self._percent_preference("subtitle_zoom", 100, 70, 180)
+        self.zoom_label = ctk.StringVar(value=f"{self.zoom_percent}%")
+        self.overlay_alpha_label = ctk.StringVar(value=f"{self.overlay_alpha_percent}%")
+        self.zoom_slider = None
         self.stream = None
         self.start_request = None
         self.current_run = None
@@ -368,19 +468,46 @@ class InterpreterWindow(ctk.CTk):
     def _size_fonts(self):
         box = self.transcript
         factor = min(1.1, max(.85, self.body.winfo_width() / self.body._get_widget_scaling() / 620))
+        zoom = self.zoom_percent / 100
         for tag, size, color, before, after, weight in (
             ("stamp", 9, MUTED, 10, 3, "normal"), ("original", 11, SUB, 0, 4, "normal"),
             ("translation", 11, INK, 0, 12, "normal")):
-            box.tag_configure(tag, font=(FONT, max(8, round(size * factor * self.zoom)), weight),
+            box.tag_configure(tag, font=(FONT, max(8, round(size * factor * zoom)), weight),
                               foreground=color, spacing1=before, spacing3=after)
 
-        box.tag_configure("english", font=(FONT, max(8, round(11 * factor * self.zoom)) + 1, "normal"))
+        box.tag_configure("english", font=(FONT, max(8, round(11 * factor * zoom)) + 1, "normal"))
         box.tag_raise("english")
 
     def _zoom(self, event):
-        self.zoom = min(1.8, max(.7, self.zoom + (.1 if event.delta > 0 else -.1)))
-        self._size_fonts()
+        if event.delta:
+            self.set_subtitle_zoom(self.zoom_percent + (10 if event.delta > 0 else -10))
         return "break"
+
+    def _percent_preference(self, name, default, lower, upper):
+        try:
+            value = int(self.history_store.preference(name, str(default)))
+        except ValueError:
+            return default
+        return max(lower, min(upper, value))
+
+    def set_subtitle_zoom(self, value):
+        percent = max(70, min(180, round(value)))
+        if percent != self.zoom_percent:
+            self.zoom_percent = percent
+            self.zoom_label.set(f"{percent}%")
+            if self.zoom_slider is not None:
+                self.zoom_slider.set(percent)
+            self._size_fonts()
+            self.history_store.set_preference("subtitle_zoom", str(percent))
+
+    def set_overlay_alpha(self, value):
+        percent = max(55, min(100, round(value)))
+        if percent != self.overlay_alpha_percent:
+            self.overlay_alpha_percent = percent
+            self.overlay_alpha_label.set(f"{percent}%")
+            if self.overlay is not None:
+                self.overlay.attributes("-alpha", percent / 100)
+            self.history_store.set_preference("overlay_alpha", str(percent))
 
     def _build_dock(self):
         dock = ctk.CTkFrame(self.main, fg_color="transparent")
@@ -423,10 +550,28 @@ class InterpreterWindow(ctk.CTk):
     def toggle_history(self):
         self.set_panel(None if self.panel == "history" else "history")
 
+    def _load_ball_position(self):
+        saved = self.history_store.preference("overlay_position", "")
+        try:
+            x, y = map(int, saved.split(","))
+            return x, y
+        except ValueError:
+            return None
+
+    def _remember_ball_position(self):
+        if self.ball_position is not None:
+            x, y = self.ball_position
+            self.history_store.set_preference("overlay_position", f"{x},{y}")
+
     def close_overlay(self):
         if self.overlay is not None:
             self.overlay.destroy()
-            self.overlay = None
+            self.overlay = self.overlay_ticker = None
+
+    def _show_overlay_translation(self, text):
+        self.overlay_subtitle = text
+        if self.overlay_ticker is not None:
+            self.overlay_ticker.show(text)
 
     def update_overlay(self):
         if not self.float_enabled.get():
@@ -434,20 +579,36 @@ class InterpreterWindow(ctk.CTk):
             return
         if self.overlay is not None:
             return
-        # Use a colour-keyed window: the only visible and clickable surface is the portrait.
         chroma = "#FF00FF"
         win = self.overlay = tk.Toplevel(self, background=chroma, takefocus=False)
         win.withdraw()
         win.title("录制悬浮球")
         win.overrideredirect(True)
-        win.attributes("-toolwindow", True)
-        win.attributes("-transparentcolor", chroma)
+        if sys.platform == "win32":
+            win.attributes("-toolwindow", True)
+            win.attributes("-transparentcolor", chroma)
+        win.attributes("-alpha", self.overlay_alpha_percent / 100)
         win.attributes("-topmost", True)
         scale = self.main._get_widget_scaling()
         size = round(60 * scale)
+        ticker_y = size + round(4 * scale)
+        width = round(OverlayTicker.WIDTH * scale)
+        height = ticker_y + round(OverlayTicker.HEIGHT * scale)
+        self.overlay_ticker = OverlayTicker(win, chroma, scale, ticker_y)
+
+        def settle(x, y):
+            left, top, right, bottom = monitor_work_area(self, (x, y))
+            x = max(left, min(right - size, x))
+            y = max(top, min(bottom - height, y))
+            base = max(left, min(right - width, x + size - width))
+            return x, y, base
+
         def move_to(x, y):
+            x, y, base = settle(x, y)
             self.ball_position = (x, y)
-            win.geometry(f"+{x}+{y}")
+            self.float_canvas.place_configure(x=x - base)
+            move_overlay_window(win, base, y)
+
         def click():
             if self.closing:
                 return
@@ -456,19 +617,29 @@ class InterpreterWindow(ctk.CTk):
             if was_recording:
                 self.deiconify()
                 self.lift()
-        self.float_canvas = RecordOrb(win, self.orbs, scale, chroma, click, move_to)
+
+        self.float_canvas = RecordOrb(win, self.orbs, scale, chroma, click, move_to, self._remember_ball_position)
         self.float_canvas.set_state(self.recording or self.start_request is not None, not self.closing)
-        self.float_canvas.pack()
-        x, y = self.ball_position or default_orb_position(self, size, scale)
-        win.geometry(f"{size}x{size}+{x}+{y}")
+        if self.ball_position is None:
+            left, top, right, bottom = monitor_work_area(self)
+            margin = round(12 * scale)
+            position = max(left, right - size - margin), max(top, bottom - height - margin)
+        else:
+            position = self.ball_position
+        x, y, base = settle(*position)
+        self.ball_position = (x, y)
+        self.float_canvas.place(x=x - base, y=0)
+        self.overlay_ticker.show(self.overlay_subtitle)
+        win.geometry(f"{width}x{height}+{max(0, base)}+{max(0, y)}")
         win.deiconify()
+        win.update_idletasks()
+        move_overlay_window(win, base, y)
 
     def toggle_settings(self):
         if self.settings_page is not None:
             self.close_settings()
             return
         self.close_export()
-        self.close_archive()
         self._close_row_menu()
         self.settings_page = ctk.CTkFrame(self.main, corner_radius=0, fg_color=PAPER)
         self.settings_page.grid(row=0, column=0, rowspan=2, sticky="nsew")
@@ -477,8 +648,12 @@ class InterpreterWindow(ctk.CTk):
 
     def close_settings(self):
         if self.settings_page is not None:
+            self._close_row_menu()
             self.settings_page.destroy()
-            self.settings_page = self.settings_tab = None
+            self.settings_page = self.settings_tab = self.archive_list = None
+            self.archive_rows.clear()
+            self.archive_row_updates.clear()
+            self.zoom_slider = None
 
     def _escape(self, _event):
         if self.row_menu is not None:
@@ -487,8 +662,6 @@ class InterpreterWindow(ctk.CTk):
             self.close_settings()
         elif self.export_page is not None:
             self.close_export()
-        elif self.archive_page is not None:
-            self.close_archive()
         else:
             self.set_panel(None)
         return "break"
@@ -498,7 +671,6 @@ class InterpreterWindow(ctk.CTk):
             self.close_export()
         elif self.view_id is not None:
             self.close_settings()
-            self.close_archive()
             self._close_row_menu()
             page = self.export_page = ctk.CTkFrame(self.main, corner_radius=0, fg_color=PAPER)
             page.grid(row=0, column=0, rowspan=2, sticky="nsew")
@@ -556,7 +728,6 @@ class InterpreterWindow(ctk.CTk):
         footer = ctk.CTkFrame(self.side, fg_color="transparent")
         footer.pack(side="bottom", fill="x", padx=10, pady=(1, 6))
         self._sidebar_button(footer, "设置", self.toggle_settings, icon="\ue713").pack(side="left")
-        self._sidebar_button(footer, "已归档", self._toggle_archive, icon="\ue7b8").pack(side="right")
         self.listing = ctk.CTkScrollableFrame(self.side, fg_color="transparent", scrollbar_button_color=BORDER)
         self.listing.pack(fill="both", expand=True, padx=(9, 3), pady=(3, 0))
         self._history_list()
@@ -594,7 +765,7 @@ class InterpreterWindow(ctk.CTk):
         self.history_rows.clear()
         self.session_sections.clear()
         self.menu_row_updates.clear()
-        projects = dict(self.history_store.projects())
+        projects = dict(self.history_store.projects(archived=False))
         grouped = {}
         for sid, started, title, pid, archived in self.history_store.library_sessions():
             if not archived:
@@ -707,38 +878,44 @@ class InterpreterWindow(ctk.CTk):
         refresh()
         return card
 
-    def _session_row(self, parent, sid, started, title, project, *, archived=False):
+    def _session_row(self, parent, sid, started, title, project, *, archived=False, project_archived=False):
         return self._history_row(
             parent, ("session", sid), title or datetime.fromtimestamp(started).strftime("%m.%d %H:%M"),
             lambda: self.select_session(sid),
-            lambda row: self._session_menu(row, sid, project, archived),
-            lambda _row: self.rename_from_history(sid), archive=archived,
+            lambda row: self._session_menu(row, sid, project, archived, project_archived),
+            lambda _row: self.rename_from_history(sid), archive=archived or project_archived,
         )
 
-    def _project_menu(self, row, pid):
-        self._show_row_menu(row, ("project", pid), [
-            ("在此新建会话", "\ue710", lambda: self.new_session(pid)),
+    def _project_menu(self, row, pid, *, archived=False):
+        actions = []
+        if not archived:
+            actions.append(("在此新建会话", "\ue710", lambda: self.new_session(pid)))
+        actions.extend([
             ("导出项目 ZIP", "\ue896", lambda: self._export_from_menu(pid)),
+            ("恢复项目" if archived else "归档项目", "\ue7b8", lambda: self._archive_project(pid, not archived)),
         ])
+        self._show_row_menu(row, ("project", pid), actions)
 
     def _export_from_menu(self, pid):
         self._close_row_menu()
         self._export_project(pid)
 
-    def _session_menu(self, row, sid, pid, archived):
-        self._show_row_menu(row, ("session", sid), [
+    def _session_menu(self, row, sid, pid, archived, project_archived=False):
+        actions = [
             ("重命名", "\ue70f", lambda: self.rename_from_history(sid)),
-            ("移入项目   ›", "\ue8b7", lambda: self._move_menu(row, sid, pid, archived)),
+            ("移入项目   ›", "\ue8b7", lambda: self._move_menu(row, sid, pid, archived, project_archived)),
             ("导出 TXT", "\ue896", lambda: self._export_session(sid)),
-            ("恢复会话" if archived else "归档", "\ue7b8", lambda: self._archive(sid, not archived)),
-            ("删除", "\ue74d", lambda: self.confirm_delete(row, sid)),
-        ])
+        ]
+        if not project_archived:
+            actions.append(("恢复会话" if archived else "归档", "\ue7b8", lambda: self._archive(sid, not archived)))
+        actions.append(("删除", "\ue74d", lambda: self.confirm_delete(row, sid)))
+        self._show_row_menu(row, ("session", sid), actions)
 
-    def _move_menu(self, row, sid, current, archived):
+    def _move_menu(self, row, sid, current, archived, project_archived):
         choices = [(self._shorten_title(name, 126), "\ue8b7", lambda n=pid: self._move(sid, n))
-                   for pid, name in self.history_store.projects() if pid != current]
+                   for pid, name in self.history_store.projects(archived=False) if pid != current]
         self._show_row_menu(row, ("move", sid), [
-            ("返回", "\ue72b", lambda: self._session_menu(row, sid, current, archived)),
+            ("返回", "\ue72b", lambda: self._session_menu(row, sid, current, archived, project_archived)),
             ("创建项目并移入", "\ue710", lambda: self._project_form(row, sid=sid)),
             *([("移出当前项目", "\ue8b7", lambda: self._move(sid, None))] if current is not None else []),
             *choices,
@@ -827,54 +1004,63 @@ class InterpreterWindow(ctk.CTk):
         self.recent_open = not self.recent_open
         self._history_list()
 
-    def _toggle_archive(self):
-        if self.archive_page is not None:
-            self.close_archive()
-            return
-        self.close_settings()
-        self.close_export()
-        self._close_row_menu()
-        page = self.archive_page = ctk.CTkFrame(self.main, corner_radius=0, fg_color=PAPER)
-        page.grid(row=0, column=0, rowspan=2, sticky="nsew")
-        page.lift()
-        header = ctk.CTkFrame(page, fg_color="transparent")
-        header.pack(fill="x", padx=18, pady=(9, 4))
-        self._page_heading(header, "已归档", self.close_archive)
-        self.archive_list = ctk.CTkScrollableFrame(page, fg_color="transparent",
-                                                  scrollbar_fg_color=SCROLL_TRACK, scrollbar_button_color=SCROLL_THUMB,
-                                                  scrollbar_button_hover_color=SCROLL_HOVER)
-        self.archive_list.pack(fill="both", expand=True, padx=(18, 12), pady=(2, 8))
-        archive_scroll = self.archive_list._scrollbar
-        def update_scroll(first, last):
-            archive_scroll.set(first, last)
-            if float(first) <= 0.0 and float(last) >= 1.0:
-                archive_scroll.grid_remove()
-            else:
-                archive_scroll.grid()
-        self.archive_list._parent_canvas.configure(yscrollcommand=update_scroll)
-        self._draw_archive()
-
     def _draw_archive(self):
-        if self.archive_page is None:
+        if self.archive_list is None:
             return
+        self._close_row_menu()
         self.archive_rows.clear()
         self.archive_row_updates.clear()
         for child in self.archive_list.winfo_children():
             child.destroy()
-        archived = [(sid, started, title, pid) for sid, started, title, pid, is_archived
-                    in self.history_store.library_sessions() if is_archived]
-        if not archived:
-            label(self.archive_list, "暂无归档会话", 12, MUTED).pack(anchor="w", padx=6, pady=12)
-        for sid, started, title, pid in archived:
+        projects = dict(self.history_store.projects(archived=True))
+        grouped = {pid: [] for pid in projects}
+        loose = []
+        for sid, started, title, pid, archived in self.history_store.library_sessions():
+            item = (sid, started, title, pid)
+            if pid in projects:
+                grouped[pid].append(item)
+            elif archived:
+                loose.append(item)
+        if not projects and not loose:
+            label(self.archive_list, "暂无归档项目或会话", 12, MUTED).pack(anchor="w", padx=6, pady=12)
+            return
+        if projects:
+            label(self.archive_list, "项目", 11, MUTED, bold=True).pack(anchor="w", padx=6, pady=(6, 4))
+        for pid, name in projects.items():
+            opened = pid in self.expanded_archived_projects
+            self._history_row(
+                self.archive_list, ("project", pid), name, lambda n=pid: self._toggle_archived_project(n),
+                lambda row, n=pid: self._project_menu(row, n, archived=True),
+                lambda row, n=pid, title=name: self._project_form(row, pid=n, name=title),
+                icon=self.folder_icons[opened], archive=True,
+            )
+            if opened:
+                section = ctk.CTkFrame(self.archive_list, fg_color="transparent")
+                section.pack(fill="x", padx=(18, 0))
+                if not grouped[pid]:
+                    label(section, "暂无会话", 11, MUTED).pack(anchor="w", padx=6)
+                for sid, started, title, project in grouped[pid]:
+                    self._session_row(section, sid, started, title, project, project_archived=True)
+        if loose:
+            label(self.archive_list, "会话", 11, MUTED, bold=True).pack(anchor="w", padx=6, pady=(8, 4))
+        for sid, started, title, pid in loose:
             self._session_row(self.archive_list, sid, started, title, pid, archived=True)
 
-    def close_archive(self):
-        if self.archive_page is not None:
-            self._close_row_menu()
-            self.archive_page.destroy()
-            self.archive_page = None
-            self.archive_rows.clear()
-            self.archive_row_updates.clear()
+    def _toggle_archived_project(self, pid):
+        self.expanded_archived_projects.symmetric_difference_update({pid})
+        self._draw_archive()
+
+    def _archive_project(self, pid, archive):
+        self.history_store.archive_project(pid, archive)
+        self._close_row_menu()
+        if archive and self.draft_project == pid:
+            self.draft_project = None
+        if not archive:
+            self.expanded_archived_projects.discard(pid)
+            self.expanded_projects.add(pid)
+        self._history_list()
+        self._draw_archive()
+        self.status.set("项目已归档，可在「设置 → 已归档」恢复" if archive else "项目已恢复")
 
     def _archive(self, sid, archive):
         self.history_store.archive_session(sid, archive)
@@ -921,6 +1107,7 @@ class InterpreterWindow(ctk.CTk):
             if pid is None:
                 self.expanded_projects.add(project)
             self._history_list()
+            self._draw_archive()
             self.status.set("项目已创建" if pid is None else "项目名称已保存")
 
         entry.bind("<Return>", lambda _: save())
@@ -1027,19 +1214,23 @@ class InterpreterWindow(ctk.CTk):
         tabs = ctk.CTkFrame(page, fg_color="transparent")
         tabs.pack(fill="x", padx=18, pady=(0, 4))
         sections = {}
-        for name in ("录制", "翻译服务", "外观"):
+        for name in ("录制", "翻译服务", "外观", "已归档"):
             frame = ctk.CTkScrollableFrame(page, fg_color="transparent", scrollbar_button_color=BORDER)
-            tab = button(tabs, name, lambda n=name: show(n), 64)
+            tab = button(tabs, name, lambda n=name: show(n), 61)
             tab.pack(side="left", padx=(0, 3))
             sections[name] = (tab, frame)
+        self.archive_list = sections["已归档"][1]
 
         def show(name):
+            self._close_row_menu()
             for key, (tab, frame) in sections.items():
                 tab.configure(fg_color=SELECT if key == name else "transparent")
                 if key == name:
                     frame.pack(fill="both", expand=True, padx=(18, 12), pady=(0, 4))
                 else:
                     frame.pack_forget()
+            if name == "已归档":
+                self._draw_archive()
 
         def caption(parent, text):
             label(parent, text, 12, INK, bold=True).pack(anchor="w", padx=3, pady=(5, 3))
@@ -1096,20 +1287,25 @@ class InterpreterWindow(ctk.CTk):
             self.entries[account] = entry
 
         appearance = sections["外观"][1]
-        caption(appearance, "悬浮球")
+
+        def slider_row(text, readout, limits, steps, value, change):
+            row = ctk.CTkFrame(appearance, fg_color="transparent")
+            row.pack(fill="x", padx=3, pady=(7, 1))
+            label(row, text, 12, INK, bold=True).pack(side="left")
+            label(row, "", 11, MUTED, textvariable=readout).pack(side="right")
+            control = ctk.CTkSlider(appearance, from_=limits[0], to=limits[1], number_of_steps=steps,
+                                    button_color=ACCENT, progress_color="#A6B9DF", button_hover_color=SUB, command=change)
+            control.set(value)
+            control.pack(fill="x", padx=3, pady=(4, 7))
+            return control
+
+        self.zoom_slider = slider_row("字幕字号", self.zoom_label, (70, 180), 11, self.zoom_percent, self.set_subtitle_zoom)
         ctk.CTkSwitch(appearance, text="显示桌面悬浮球", variable=self.float_enabled, command=self.update_overlay,
-                      text_color=SUB, font=font(12), progress_color=ACCENT).pack(anchor="w", padx=3, pady=5)
-        caption(appearance, "窗口透明度")
-        slider = ctk.CTkSlider(appearance, from_=.55, to=1., width=150, button_color=ACCENT, progress_color="#A6B9DF",
-                               button_hover_color=SUB, command=self.set_opacity)
-        slider.set(self.opacity)
-        slider.pack(anchor="w", padx=3, pady=(4, 8))
+                      text_color=SUB, font=font(12), progress_color=ACCENT).pack(anchor="w", padx=3, pady=(8, 2))
+        slider_row("悬浮球不透明度", self.overlay_alpha_label, (55, 100), 9,
+                   self.overlay_alpha_percent, self.set_overlay_alpha)
         self.settings_tab = show
         show("录制")
-
-    def set_opacity(self, value):
-        self.opacity = float(value)
-        self.attributes("-alpha", self.opacity)
 
     def save_settings(self):
         try:
@@ -1202,7 +1398,6 @@ class InterpreterWindow(ctk.CTk):
     def select_session(self, sid):
         self.close_settings()
         self.close_export()
-        self.close_archive()
         self._close_row_menu()
         self.status.set("")
         self._select(sid)
@@ -1212,6 +1407,7 @@ class InterpreterWindow(ctk.CTk):
             self.status.set("请先点击头像暂停录制或取消启动")
             return
         self.session_id = None
+        self._show_overlay_translation("")
         self.draft_project = project_id
         if project_id is not None and project_id not in self.expanded_projects:
             self.expanded_projects.add(project_id)
@@ -1338,6 +1534,8 @@ class InterpreterWindow(ctk.CTk):
         run.previous_saved = prior.saved if prior else None
         self.pending_runs.append(run)
         self.current_run = run
+        if self.session_id != sid:
+            self._show_overlay_translation("")
         self.session_id = sid
         self.recording = True
         self.partial = ("", "")
@@ -1404,6 +1602,8 @@ class InterpreterWindow(ctk.CTk):
                 self.partial = ("", "") if final else (src, dst)
             if final:
                 self.history_store.append(sid, start, end, src, dst)
+                if sid == self.session_id and dst.strip():
+                    self._show_overlay_translation(dst)
             if self.view_id == sid:
                 self._write_segment(start, end, src, dst, final=final)
         elif e[0] == "status":
