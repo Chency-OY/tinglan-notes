@@ -1,12 +1,12 @@
 """Ordered speech translation routes for interactive microphone sessions."""
 from __future__ import annotations
 
-from collections import deque
 import json
 import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -115,6 +115,8 @@ def translate_segment(client, pcm, routes, keys, notify, previous=None):
                                     files={"file": ("speech.wav", wav_bytes(pcm), "audio/wav")})
                     r.raise_for_status()
                     source = r.json()["text"].strip()
+                if source.strip().upper() == "[BLANK_AUDIO]":
+                    return "", ""
                 if not source:
                     raise ValueError("未识别到文字")
                 notify(("source", source))
@@ -153,23 +155,21 @@ def vad_frames(app):
 
 def speech_batches(app):
     detector = webrtcvad.Vad(1)
-    preroll = deque(maxlen=10)  # Keep the onset even when VAD responds a little late.
+    heard_voice = False
     audio = bytearray()
     offset = quiet_bytes = 0
     for frame in vad_frames(app):
         voiced = detector.is_speech(frame.ljust(VAD_FRAME_BYTES, b"\0"), SAMPLE_RATE) and any(frame)
         offset += len(frame)
-        if not audio and not voiced:
-            preroll.append(frame)
-            continue
-        if not audio:
-            audio.extend(b"".join(preroll))
-            preroll.clear()
+        if not audio and not any(frame):
+            continue  # Omit only digital silence between segments. Retain quiet or uncertain speech.
+        heard_voice = heard_voice or voiced
         audio.extend(frame)
         quiet_bytes = 0 if voiced else quiet_bytes + len(frame)
-        if quiet_bytes >= PAUSE_BYTES or len(audio) >= MINUTE_BYTES:
+        if (heard_voice and quiet_bytes >= PAUSE_BYTES) or len(audio) >= MINUTE_BYTES:
             yield bytes(audio), offset - len(audio)
             audio.clear()
+            heard_voice = False
             quiet_bytes = 0
     if audio:
         yield bytes(audio), offset - len(audio)
@@ -177,17 +177,35 @@ def speech_batches(app):
 
 def priority_loop(app):
     sid = app.session_id
-    previous = app.history_store.last_translation(sid)
-    with httpx.Client(timeout=httpx.Timeout(90., connect=8.)) as client:
-        for pcm, offset in speech_batches(app):
-            if not any(pcm):
-                continue
-            start = app.capture_started + offset / (2 * SAMPLE_RATE)
-            end = app.capture_started + (offset + len(pcm)) / (2 * SAMPLE_RATE)
-            app.events.put(("status", "正在识别和翻译本段…"))
-            source, target = translate_segment(client, pcm, app.active_routes, app.route_keys,
-                                               app.events.put, previous)
-            if source or target:
-                app.events.put(("final_pair", start, end, source, target, sid))
-            if source and target:
-                previous = (source, target)
+    jobs = queue.SimpleQueue()
+
+    def segment_audio():
+        try:
+            for batch in speech_batches(app):
+                jobs.put(batch)
+        except Exception as exc:
+            app.events.put(("status", f"音频分段失败 · {type(exc).__name__}"))
+        finally:
+            jobs.put(None)
+
+    # ASR, HTTP and provider retries never run on the capture or segmentation threads.
+    producer = threading.Thread(target=segment_audio, daemon=True)
+    producer.start()
+    try:
+        if app.previous_saved is not None:
+            app.previous_saved.wait()
+        previous = app.history_store.last_translation(sid)
+        with httpx.Client(timeout=httpx.Timeout(90., connect=8.)) as client:
+            for pcm, offset in iter(jobs.get, None):
+                start = app.capture_started + offset / (2 * SAMPLE_RATE)
+                end = app.capture_started + (offset + len(pcm)) / (2 * SAMPLE_RATE)
+                app.events.put(("status", "正在识别和翻译本段…"))
+                source, target = translate_segment(client, pcm, app.active_routes, app.route_keys,
+                                                   app.events.put, previous)
+                if source or target:
+                    app.events.put(("final_pair", start, end, source, target, sid))
+                if source and target:
+                    previous = (source, target)
+    finally:
+        app.stop_event.set()
+        producer.join()

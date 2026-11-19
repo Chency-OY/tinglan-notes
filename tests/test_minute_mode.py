@@ -14,7 +14,7 @@ from routes import MINUTE_BYTES, speech_batches, priority_loop, translate_text
 def buffered_app(pcm):
     app = SimpleNamespace(audio=queue.SimpleQueue(), events=queue.SimpleQueue(), stop_event=threading.Event(),
                           session_id=7, capture_started=100., route_keys={}, active_routes=["DeepSeek"],
-                          history_store=Mock())
+                          history_store=Mock(), previous_saved=None)
     for pos in range(0, len(pcm), FRAME_SAMPLES * 2):
         app.audio.put(pcm[pos:pos + FRAME_SAMPLES * 2])
     app.stop_event.set()

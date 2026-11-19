@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import queue
+import re
 import sys
 import threading
 import time
@@ -181,8 +182,35 @@ class RecordOrb(tk.Canvas):
             self.invoke()
 
 
-class InterpreterWindow(ctk.CTk):
+class RecordingRun:
+    """Capture and worker state for one uninterrupted microphone interval."""
     capture = AudioBackend.capture
+
+    def __init__(self, history_store, keys, routes):
+        self.history_store = history_store
+        self.route_keys = keys
+        self.active_routes = routes
+        self.audio = queue.SimpleQueue()
+        self.events = queue.SimpleQueue()
+        self.stop_event = threading.Event()
+        self.saved = threading.Event()
+        self.previous_saved = None
+        self.session_id = None
+        self.capture_started = 0.
+        self.failure = ""
+
+    def process(self, backend):
+        try:
+            if backend is AudioBackend.tencent_loop and self.previous_saved is not None:
+                self.previous_saved.wait()
+            backend(self)
+        except Exception as exc:
+            self.events.put(("status", f"录制中断 · {type(exc).__name__}"))
+        finally:
+            self.events.put(("finished",))
+
+
+class InterpreterWindow(ctk.CTk):
 
     def __init__(self, history_store=None):
         ctk.set_appearance_mode("light")
@@ -207,12 +235,9 @@ class InterpreterWindow(ctk.CTk):
         self.before_settings = None
         self.export_folder = ctk.StringVar(value=str(Path.home() / "Documents" / "同传记录"))
         self.zoom = 1.
-        self.worker = self.stream = None
-        self.capture_started = 0.
-        self.capture_ended = None
-        self.stop_event = threading.Event()
-        self.events = queue.Queue()
-        self.audio = queue.Queue(maxsize=100)
+        self.stream = None
+        self.current_run = None
+        self.pending_runs = []
         self.partial = ("", "")
         self.titled_sessions = set()
         self.devices = {f"{i} · {d['name']}": i for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0}
@@ -292,6 +317,9 @@ class InterpreterWindow(ctk.CTk):
             box.tag_configure(tag, font=(FONT, max(8, round(size * factor * self.zoom)), weight),
                               foreground=color, spacing1=before, spacing3=after)
 
+        box.tag_configure("english", font=(FONT, max(8, round(11 * factor * self.zoom)) + 1, "normal"))
+        box.tag_raise("english")
+
     def _zoom(self, event):
         self.zoom = min(1.8, max(.7, self.zoom + (.1 if event.delta > 0 else -.1)))
         self._size_fonts()
@@ -315,12 +343,11 @@ class InterpreterWindow(ctk.CTk):
         self.orb.grid(row=1, column=1, padx=3, pady=3)
 
     def _dock_state(self):
-        stopping = self.recording and self.stop_event.is_set()
-        text = "正在保存…" if stopping else "点击头像暂停" if self.recording else "点击头像继续" if self.view_id else "点击头像录制"
+        text = "点击头像暂停" if self.recording else "点击头像继续" if self.view_id else "点击头像录制"
         self.action.configure(text=text)
-        self.orb.set_state(self.recording, not stopping)
+        self.orb.set_state(self.recording, not self.closing)
         if self.overlay is not None:
-            self.float_canvas.set_state(self.recording, not stopping)
+            self.float_canvas.set_state(self.recording, not self.closing)
         if self.recording and self.view_id != self.session_id:
             self.action.pack_forget()
             self.live_link.pack(side="left")
@@ -365,7 +392,7 @@ class InterpreterWindow(ctk.CTk):
                 self.deiconify()
                 self.lift()
         self.float_canvas = RecordOrb(win, self.orbs, scale, chroma, click, move_to)
-        self.float_canvas.set_state(self.recording, not self.stop_event.is_set() or not self.recording)
+        self.float_canvas.set_state(self.recording, not self.closing)
         self.float_canvas.pack()
         x, y = self.ball_position or default_orb_position(self, size, scale)
         win.geometry(f"{size}x{size}+{x}+{y}")
@@ -465,8 +492,8 @@ class InterpreterWindow(ctk.CTk):
         self.status.set("名称已保存")
 
     def confirm_delete(self, sid, actions):
-        if self.recording and self.session_id == sid:
-            self.status.set("请先暂停录制，再删除这段会话")
+        if any(run.session_id == sid for run in self.pending_runs):
+            self.status.set("请等这段录制结束并保存后再删除")
             return
         for child in actions.winfo_children():
             child.destroy()
@@ -474,7 +501,7 @@ class InterpreterWindow(ctk.CTk):
         button(actions, "取消", self._history_list, 42).pack(side="left")
 
     def delete_session(self, sid):
-        if self.recording and self.session_id == sid:
+        if any(run.session_id == sid for run in self.pending_runs):
             return
         self.history_store.delete_session(sid)
         if self.session_id == sid:
@@ -621,8 +648,13 @@ class InterpreterWindow(ctk.CTk):
         if ended:
             stamp += datetime.fromtimestamp(ended).strftime("  –  %H:%M:%S")
         box.insert("end-1c", stamp + "\n", "stamp")
-        box.insert("end-1c", original + "\n", "original")
-        box.insert("end-1c", (translated or ("本段未取得译文" if final else "翻译中…")) + "\n", "translation")
+        translation = translated or ("本段未取得译文" if final else "翻译中…")
+        for text, tag in ((original, "original"), (translation, "translation")):
+            for part in re.split(r"([A-Za-z][A-Za-z0-9 ,.'’:/()!?-]*)", text):
+                if part:
+                    tags = (tag, "english") if part[0].isascii() and part[0].isalpha() else (tag,)
+                    box.insert("end-1c", part, tags)
+            box.insert("end-1c", "\n", tag)
         if final:
             box.mark_set("draft", "end-1c")
         box.configure(state="disabled")
@@ -669,16 +701,14 @@ class InterpreterWindow(ctk.CTk):
         if self.closing:
             return
         if self.recording:
-            self._stop_capture()
-            self._dock_state()
-            self.status.set("正在保存最后一段…")
+            self._pause_capture()
             return
         realtime = self.mode.get() == "腾讯云 实时"
         candidates = ["腾讯云"] if realtime else self.priority
         try:
-            self.route_keys = {key: keyring.get_password(SERVICE, key) for name in candidates for key in KEYS[name]}
-            self.active_routes = [name for name in candidates if all(self.route_keys[key] for key in KEYS[name])]
-            missing = not self.active_routes
+            keys = {key: keyring.get_password(SERVICE, key) for name in candidates for key in KEYS[name]}
+            routes = [name for name in candidates if all(keys[key] for key in KEYS[name])]
+            missing = not routes
         except Exception:
             self.status.set("无法读取 Windows 凭据，请检查设置")
             return
@@ -687,16 +717,14 @@ class InterpreterWindow(ctk.CTk):
             if self.panel != "settings":
                 self.toggle_settings()
             return
-        self.audio = queue.Queue(maxsize=100) if realtime else queue.SimpleQueue()
-        self.stop_event.clear()
-        self.capture_ended = None
+        run = RecordingRun(self.history_store, keys, routes)
         try:
             self.stream = sd.RawInputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
-                                           blocksize=FRAME_SAMPLES, device=self.devices[self.device.get()], callback=self.capture)
-            self.capture_started = time.time()
+                                           blocksize=FRAME_SAMPLES, device=self.devices[self.device.get()], callback=run.capture)
+            run.capture_started = time.time()
             self.stream.start()
             if self.view_id is None:
-                sid = self.history_store.begin(self.active_routes[0], self.draft_title or None)
+                sid = self.history_store.begin(routes[0], self.draft_title or None)
                 self.draft_title = ""
             else:
                 sid = self.view_id
@@ -705,6 +733,11 @@ class InterpreterWindow(ctk.CTk):
             self._close_stream()
             self.status.set(f"无法开始录制 · {exc}")
             return
+        run.session_id = sid
+        prior = next((r for r in reversed(self.pending_runs) if r.session_id == sid), None)
+        run.previous_saved = prior.saved if prior else None
+        self.pending_runs.append(run)
+        self.current_run = run
         self.session_id = sid
         self.recording = True
         self.partial = ("", "")
@@ -715,24 +748,27 @@ class InterpreterWindow(ctk.CTk):
             for menu in self.options:
                 menu.configure(state="disabled")
         backend = AudioBackend.tencent_loop if realtime else priority_loop
-        self.worker = threading.Thread(target=self._run, args=(backend,), daemon=True)
-        self.worker.start()
+        threading.Thread(target=run.process, args=(backend,), daemon=True).start()
 
-    def _run(self, backend):
-        try:
-            backend(self)
-        except Exception as exc:
-            self.events.put(("status", f"录制中断 · {type(exc).__name__}"))
-        finally:
-            self.events.put(("finished",))
-
-    def _stop_capture(self):
-        if self.capture_ended is None:
-            self.capture_ended = time.time()
+    def _pause_capture(self):
+        run = self.current_run
+        ended = time.time()
         try:
             self._close_stream()
         finally:
-            self.stop_event.set()
+            run.stop_event.set()
+            self.current_run = None
+            self.recording = False
+            self.history_store.end(run.session_id, ended)
+            self._header_state()
+            self._dock_state()
+            if self.view_id == run.session_id and not self.has_text:
+                self.empty_title.configure(text="已暂停收音")
+                self.empty_hint.configure(text="收到的译文会保存在本次会话")
+            self.status.set("已暂停收音 · 剩余译文在后台保存")
+            if self.panel == "settings":
+                for menu in self.options:
+                    menu.configure(state="normal")
 
     def _close_stream(self):
         if self.stream is not None:
@@ -742,45 +778,52 @@ class InterpreterWindow(ctk.CTk):
             finally:
                 stream.close()
 
-    def poll(self):
-        while not self.events.empty():
-            e = self.events.get_nowait()
-            if e[0] in ("source", "pair", "final_pair"):
-                if e[0] == "source":
-                    start, end, src, dst, sid = time.time(), None, e[1], "", self.session_id
-                else:
-                    _, start, end, src, dst, sid = e
-                final = e[0] == "final_pair"
-                if sid is None or not (src or dst):
-                    continue
+    def _receive(self, run, e):
+        sid = run.session_id
+        if e[0] in ("source", "pair", "final_pair"):
+            if e[0] == "source":
+                start, end, src, dst = time.time(), None, e[1], ""
+            else:
+                _, start, end, src, dst, _ = e
+            if not (src or dst):
+                return
+            final = e[0] == "final_pair"
+            if sid == self.session_id:
                 self.partial = ("", "") if final else (src, dst)
-                if final:
-                    self.history_store.append(sid, start, end, src, dst)
-                if self.view_id == sid:
-                    self._write_segment(start, end, src, dst, final=final)
-                if final and self.panel == "history" and sid not in self.titled_sessions:
-                    self.titled_sessions.add(sid)
-                    self._history_list()
-            elif e[0] == "status":
+            if final:
+                self.history_store.append(sid, start, end, src, dst)
+            if self.view_id == sid:
+                self._write_segment(start, end, src, dst, final=final)
+            if final and self.panel == "history" and sid not in self.titled_sessions:
+                self.titled_sessions.add(sid)
+                self._history_list()
+        elif e[0] == "status":
+            if any(word in e[1] for word in ("失败", "中断", "错误", "overflow")):
+                run.failure = e[1]
+            if self.current_run is run:
                 self.status.set(e[1])
-            elif e[0] == "finished":
-                self._close_stream()
-                self.history_store.end(self.session_id, self.capture_ended)
-                self.recording = False
-                self.route_keys.clear()
-                had_partial = any(self.partial)
+        elif e[0] == "finished":
+            if self.current_run is run:
+                self._pause_capture()
+            self.pending_runs.remove(run)
+            run.route_keys.clear()
+            run.saved.set()  # Previous translations have reached SQLite before continuation.
+            if not self.recording and self.view_id == sid:
                 self.partial = ("", "")
-                if self.view_id == self.session_id and (had_partial or not self.has_text):
-                    self._select(self.view_id)
-                else:
-                    self._header_state()
-                    self._dock_state()
-                if self.status.get().startswith("正在收音") or self.status.get() == "正在保存最后一段…":
-                    self.status.set("已暂停")
-                if self.panel == "settings":
-                    for menu in self.options:
-                        menu.configure(state="normal")
-        if self.closing and not self.recording:
+                self._select(sid)
+                self.status.set(run.failure or ("已暂停收音 · 剩余译文在后台保存" if self.pending_runs else "已暂停 · 已保存"))
+
+    def poll(self):
+        for run in list(self.pending_runs):
+            for _ in range(64):
+                try:
+                    event = run.events.get_nowait()
+                except queue.Empty:
+                    break
+                self._receive(run, event)
+                if event[0] == "finished":
+                    break
+        if self.closing and not self.pending_runs:
             self.destroy()
         else:
             self.after(80, self.poll)
@@ -788,9 +831,10 @@ class InterpreterWindow(ctk.CTk):
     def close(self):
         self.closing = True
         if self.recording:
-            self._stop_capture()
+            self._pause_capture()
+        if self.pending_runs:
             self._dock_state()
-            self.status.set("正在保存最后一段…")
+            self.status.set("已停止收音 · 完成剩余翻译后自动退出")
         else:
             self.destroy()
 

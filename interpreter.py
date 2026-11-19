@@ -548,7 +548,9 @@ class Interpreter(tk.Tk):
         session_id = self.session_id
         ws = None
         try:
-            creds = [keyring.get_password(SERVICE, x) for x in ("tencent_appid", "tencent_id", "tencent_key")]
+            keys = getattr(self, "route_keys", None)
+            creds = [keys[x] if keys is not None else keyring.get_password(SERVICE, x)
+                     for x in ("tencent_appid", "tencent_id", "tencent_key")]
             ws = websocket.create_connection(tencent_url(*creds), timeout=10)
             ws.settimeout(1)
             finished = threading.Event()
@@ -556,12 +558,16 @@ class Interpreter(tk.Tk):
                 while not finished.is_set():
                     try: message = ws.recv()
                     except websocket.WebSocketTimeoutException: continue
-                    except Exception: break
+                    except Exception:
+                        finished.set()
+                        break
                     if not isinstance(message, str): continue
                     data = json.loads(message)
                     if data.get("code", 0) != 0:
                         self.events.put(("status", f"腾讯云错误：{data.get('message', data['code'])}"))
-                        self.stop_event.set(); break
+                        finished.set()
+                        self.stop_event.set()
+                        break
                     if data.get("final") == 1:
                         finished.set(); break
                     result = data.get("result")
@@ -572,7 +578,7 @@ class Interpreter(tk.Tk):
                         self.events.put((kind, started, ended, result.get("source_text", ""), result.get("target_text", ""), session_id))
             listener = threading.Thread(target=receive, daemon=True)
             listener.start()
-            while not self.stop_event.is_set():
+            while not finished.is_set() and (not self.stop_event.is_set() or not self.audio.empty()):
                 try: ws.send(self.audio.get(timeout=.3), opcode=websocket.ABNF.OPCODE_BINARY)
                 except queue.Empty: continue
             try: ws.send(json.dumps({"type":"end"}))
