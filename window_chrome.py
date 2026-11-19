@@ -50,6 +50,15 @@ def show_main_on_taskbar(hwnd, *, activate=False):
     return bool(user32.IsWindowVisible(hwnd))
 
 
+def soften_window_frame(hwnd):
+    dwm = ctypes.WinDLL("dwmapi")
+    dwm.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+    # Use the Windows corner radius and a border close to the app palette.
+    for attribute, setting in ((33, 2), (34, 0x00EDE4D7)):
+        value = wintypes.DWORD(setting)
+        dwm.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value))
+
+
 class WindowsTitleStrip(tk.Canvas):
     BACKGROUND = "#F1F4FA"
     INK = "#44516A"
@@ -76,7 +85,7 @@ class WindowsTitleStrip(tk.Canvas):
         family = "DengXian" if "dengxian" in families else "等线" if "等线" in families else "Microsoft YaHei UI"
         self.caption_font = tkfont.Font(root=window, family=family, size=-round(15 * scale))
         self.hovered = None
-        self.pressed = None
+        self.pressed = self.drag_origin = None
         self.hwnd = None
         self._install_bindings()
 
@@ -85,7 +94,9 @@ class WindowsTitleStrip(tk.Canvas):
         self.bind("<Motion>", self._motion)
         self.bind("<Leave>", self._leave)
         self.bind("<ButtonPress-1>", self._press)
+        self.bind("<B1-Motion>", self._drag)
         self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Double-Button-1>", self._double_click)
 
     def _install_native_frame(self):
         user32 = self.user32 = ctypes.WinDLL("user32")
@@ -98,6 +109,8 @@ class WindowsTitleStrip(tk.Canvas):
         self.subclass_id = id(self)
         user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
         user32.GetClientRect.restype = wintypes.BOOL
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
         user32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
         user32.ScreenToClient.restype = wintypes.BOOL
         user32.IsZoomed.argtypes = [wintypes.HWND]
@@ -127,6 +140,7 @@ class WindowsTitleStrip(tk.Canvas):
             self.comctl.RemoveWindowSubclass(hwnd, self.callback, self.subclass_id)
             self.hwnd = None
             return False
+        soften_window_frame(hwnd)
         return True
 
     def _dispatch(self, hwnd, message, wparam, lparam, _subclass, _context):
@@ -180,9 +194,7 @@ class WindowsTitleStrip(tk.Canvas):
                 return 16 if left else 17 if right else 15
             if left or right:
                 return 10 if left else 11
-        if point.y < self.bar_height and point.x < client.right - 3 * self.control_width:
-            return 2  # HTCAPTION: native drag, double click and system menu.
-        return 1      # HTCLIENT: let Tk deliver clicks to the control.
+        return 1  # The title strip handles pointer input in the Tk client area.
 
     def _button(self, x):
         index = (self.winfo_width() - 1 - x) // self.control_width
@@ -200,16 +212,58 @@ class WindowsTitleStrip(tk.Canvas):
 
     def _press(self, event):
         self.pressed = self._button(event.x)
+        self.drag_origin = None
+        if self.pressed is None and self.hwnd:
+            self.drag_origin = (event.x_root, event.y_root)
+            self.drag_offset = None
+            self.grab_set()
+
+    def _end_drag(self):
+        self.drag_origin = None
+        if self.grab_current() is self:
+            self.grab_release()
+
+    def _drag(self, event):
+        if self.drag_origin is None or not self.hwnd:
+            return
+        x, y = self.drag_origin
+        if self.drag_offset is None:
+            if abs(event.x_root - x) + abs(event.y_root - y) < 4:
+                return
+            rect = wintypes.RECT()
+            if not self.user32.GetWindowRect(self.hwnd, ctypes.byref(rect)):
+                return
+            dx, dy = x - rect.left, y - rect.top
+            if self.user32.IsZoomed(self.hwnd):
+                ratio = max(0., min(1., dx / max(1, rect.right - rect.left)))
+                _window_api().ShowWindow(self.hwnd, 9)  # Restore before moving.
+                if self.user32.GetWindowRect(self.hwnd, ctypes.byref(rect)):
+                    dx = round(ratio * (rect.right - rect.left))
+            self.drag_offset = dx, dy
+        dx, dy = self.drag_offset
+        self.user32.SetWindowPos(self.hwnd, None, event.x_root - dx, event.y_root - dy, 0, 0, 0x0015)
+
+    def _double_click(self, event):
+        if self._button(event.x) is None and self.hwnd:
+            self._end_drag()
+            self._toggle_maximize()
+        else:
+            self._press(event)
+
+    def _toggle_maximize(self):
+        command = 0xF120 if self.user32.IsZoomed(self.hwnd) else 0xF030
+        self.user32.PostMessageW(self.hwnd, 0x0112, command, 0)
 
     def _release(self, event):
+        self._drag(event)
+        self._end_drag()
         index, self.pressed = self.pressed, None
         if index is None or index != self._button(event.x) or not self.hwnd:
             return
         if index == 0:
             self.user32.PostMessageW(self.hwnd, 0x0010, 0, 0)  # WM_CLOSE
         elif index == 1:
-            command = 0xF120 if self.user32.IsZoomed(self.hwnd) else 0xF030
-            self.user32.PostMessageW(self.hwnd, 0x0112, command, 0)
+            self._toggle_maximize()
         else:
             self.user32.PostMessageW(self.hwnd, 0x0112, 0xF020, 0)
 

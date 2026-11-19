@@ -56,3 +56,35 @@ class TaskbarWindowTests(unittest.TestCase):
                     except tk.TclError:
                         pass
                 app.destroy()
+
+
+    def test_caption_moves_on_release_and_font_size_stays_visible(self):
+        user32 = ctypes.WinDLL("user32")
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        with tempfile.TemporaryDirectory() as folder, patch("ctk_app.sd.query_devices", return_value=[]):
+            store = HistoryStore(Path(folder) / "test.db")
+            store.set_preference("overlay", "0")
+            store.set_preference("subtitle_zoom", "130")
+            app = InterpreterWindow(store)
+            try:
+                app.geometry("540x330+70+100")
+                app.update()
+                strip = app.title_strip
+                self.assertIsNotNone(strip)
+                before, after = wintypes.RECT(), wintypes.RECT()
+                self.assertTrue(user32.GetWindowRect(strip.hwnd, ctypes.byref(before)))
+                x, y = 90, 18
+                strip.event_generate("<ButtonPress-1>", x=x, y=y, rootx=before.left+x, rooty=before.top+y)
+                strip.event_generate("<ButtonRelease-1>", x=x+50, y=y+40, rootx=before.left+x+50, rooty=before.top+y+40)
+                self.assertTrue(user32.GetWindowRect(strip.hwnd, ctypes.byref(after)))
+                self.assertEqual((after.left, after.top), (before.left+50, before.top+40))
+                self.assertTrue(app.size_up.winfo_viewable())
+                self.assertEqual(app.size_readout.get(), "14 pt")
+                app.size_up.invoke()
+                self.assertEqual(app.size_readout.get(), "15 pt")
+                self.assertEqual(store.preference("subtitle_size", ""), "15")
+                self.assertEqual(int(app.tk.splitlist(app.transcript.tag_cget("original", "font"))[1]), 15)
+            finally:
+                for ident in app.tk.splitlist(app.tk.call("after", "info")):
+                    app.after_cancel(ident)
+                app.destroy()

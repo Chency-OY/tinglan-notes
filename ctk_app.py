@@ -359,7 +359,7 @@ class InterpreterWindow(ctk.CTk):
         self.overlay = self.overlay_ticker = None
         self.overlay_subtitle = ""
         self.ball_position = self._load_ball_position()
-        self.overlay_alpha_percent = self._percent_preference("overlay_alpha", 90, 55, 100)
+        self.overlay_alpha_percent = self._bounded_preference("overlay_alpha", 90, 55, 100)
         self.draft_title = ""
         self.session_id = self.view_id = None
         self.recording = self.closing = False
@@ -380,17 +380,19 @@ class InterpreterWindow(ctk.CTk):
         self.exporting_project = False
         self.desktop_folder = desktop_folder()
         self.export_folder = ctk.StringVar(value=str(self.desktop_folder))
-        self.zoom_percent = self._percent_preference("subtitle_zoom", 100, 70, 180)
-        self.zoom_label = ctk.StringVar(value=f"{self.zoom_percent}%")
+        old_zoom = self._bounded_preference("subtitle_zoom", 100, 70, 180)
+        self.subtitle_size = self._bounded_preference("subtitle_size", round(11 * old_zoom / 100), 8, 24)
+        self.size_readout = ctk.StringVar(value=f"{self.subtitle_size} pt")
         self.overlay_alpha_label = ctk.StringVar(value=f"{self.overlay_alpha_percent}%")
-        self.zoom_slider = None
         self.stream = None
         self.start_request = None
         self.current_run = None
         self.pending_runs = []
         self.partial = ("", "")
         self.devices = {f"{i} · {d['name']}": i for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0}
-        self.device = ctk.StringVar(value=next(iter(self.devices), "无可用麦克风"))
+        default_input = sd.default.device[0]
+        preferred = next((name for name, index in self.devices.items() if index == default_input), None)
+        self.device = ctk.StringVar(value=preferred or next(iter(self.devices), "无可用麦克风"))
         self.status = ctk.StringVar(value="")
         portrait = Image.open(ASSETS / "icon.png").convert("RGBA")
         self.orbs = [orb_image(portrait, active) for active in (False, True)]
@@ -437,6 +439,22 @@ class InterpreterWindow(ctk.CTk):
         self.history_toggle = button(bar, "", self.toggle_history, 34)
         self.history_toggle.configure(image=sidebar_icon(), corner_radius=7)
         self.history_toggle.pack(side="left", padx=(0, 10))
+        self.settings_btn = button(bar, "\ue713", self.toggle_settings, 30, symbol=True)
+        self.settings_btn.pack(side="right")
+        self.export_btn = button(bar, "导出", self.toggle_export, 36)
+        self.export_btn.pack(side="right", padx=(3, 4))
+        sizes = ctk.CTkFrame(bar, fg_color="#EDF2FB", corner_radius=8)
+        sizes.pack(side="right", padx=(6, 0))
+        self.size_down = button(sizes, "−", lambda: self.set_subtitle_size(self.subtitle_size - 1), 23)
+        self.size_down.configure(height=26, border_spacing=0, font=font(15, bold=True, family="Segoe UI"), text_color=INK)
+        self.size_down.pack(side="left")
+        ctk.CTkLabel(sizes, textvariable=self.size_readout, width=36, height=26,
+                     font=font(11), text_color=SUB).pack(side="left")
+        self.size_up = button(sizes, "+", lambda: self.set_subtitle_size(self.subtitle_size + 1), 23)
+        self.size_up.configure(height=26, border_spacing=0, font=font(15, bold=True, family="Segoe UI"), text_color=INK)
+        self.size_up.pack(side="left")
+        self._size_button_state()
+
         title_box = self.title_box = ctk.CTkFrame(bar, fg_color="transparent")
         title_box.pack(side="left", fill="x", expand=True)
         self.heading = label(title_box, "", 16, bold=True, anchor="w")
@@ -447,12 +465,6 @@ class InterpreterWindow(ctk.CTk):
         self.title_entry.bind("<Escape>", lambda _: self.cancel_title())
         self.meta = label(title_box, "", 10, MUTED, anchor="w")
         self.meta.pack(fill="x")
-        self.settings_btn = button(bar, "\ue713", self.toggle_settings, 32, symbol=True)
-        self.settings_btn.pack(side="right")
-        self.export_btn = button(bar, "导出", self.toggle_export, 44)
-        self.export_btn.pack(side="right")
-        self.new_btn = button(bar, "\ue710", self.new_session, symbol=True)
-        self.new_btn.pack(side="right")
 
     def _build_feed(self):
         self.body = ctk.CTkFrame(self.main, fg_color="transparent")
@@ -472,42 +484,45 @@ class InterpreterWindow(ctk.CTk):
                                        command=self.transcript.yview)
         self.transcript.configure(yscrollcommand=self.scroll.set)
         self._size_fonts()
-        self.body.bind("<Configure>", lambda _: self._size_fonts())
 
     def _size_fonts(self):
         box = self.transcript
-        factor = min(1.1, max(.85, self.body.winfo_width() / self.body._get_widget_scaling() / 620))
-        zoom = self.zoom_percent / 100
-        for tag, size, color, before, after, weight in (
-            ("stamp", 9, MUTED, 10, 3, "normal"), ("original", 11, SUB, 0, 4, "normal"),
-            ("translation", 11, INK, 0, 12, "normal")):
-            box.tag_configure(tag, font=(FONT, max(8, round(size * factor * zoom)), weight),
-                              foreground=color, spacing1=before, spacing3=after)
-
-        box.tag_configure("english", font=(FONT, max(8, round(11 * factor * zoom)) + 1, "normal"))
+        for tag, size, color, before, after in (
+            ("stamp", max(8, self.subtitle_size - 2), MUTED, 10, 3),
+            ("original", self.subtitle_size, SUB, 0, 4),
+            ("translation", self.subtitle_size, INK, 0, 12),
+        ):
+            box.tag_configure(tag, font=(FONT, size, "normal"), foreground=color, spacing1=before, spacing3=after)
+        box.tag_configure("english", font=(FONT, self.subtitle_size + 1, "normal"))
         box.tag_raise("english")
 
     def _zoom(self, event):
         if event.delta:
-            self.set_subtitle_zoom(self.zoom_percent + (10 if event.delta > 0 else -10))
+            self.set_subtitle_size(self.subtitle_size + (1 if event.delta > 0 else -1))
         return "break"
 
-    def _percent_preference(self, name, default, lower, upper):
+    def _bounded_preference(self, name, default, lower, upper):
         try:
             value = int(self.history_store.preference(name, str(default)))
         except ValueError:
             return default
         return max(lower, min(upper, value))
 
-    def set_subtitle_zoom(self, value):
-        percent = max(70, min(180, round(value)))
-        if percent != self.zoom_percent:
-            self.zoom_percent = percent
-            self.zoom_label.set(f"{percent}%")
-            if self.zoom_slider is not None:
-                self.zoom_slider.set(percent)
+    def _size_button_state(self):
+        self.size_down.configure(state="disabled" if self.subtitle_size == 8 else "normal")
+        self.size_up.configure(state="disabled" if self.subtitle_size == 24 else "normal")
+
+    def set_subtitle_size(self, value):
+        size = max(8, min(24, value))
+        if size != self.subtitle_size:
+            self.subtitle_size = size
+            self.size_readout.set(f"{size} pt")
+            self._size_button_state()
+            at_bottom = self.transcript.yview()[1] >= .975
             self._size_fonts()
-            self.history_store.set_preference("subtitle_zoom", str(percent))
+            if at_bottom:
+                self.transcript.see("end")
+            self.history_store.set_preference("subtitle_size", str(size))
 
     def set_overlay_alpha(self, value):
         percent = max(55, min(100, round(value)))
@@ -526,9 +541,6 @@ class InterpreterWindow(ctk.CTk):
         self.notice.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 3))
         strip = ctk.CTkFrame(dock, fg_color="transparent")
         strip.grid(row=1, column=0, sticky="ew", padx=(4, 6))
-        badge = ctk.CTkFrame(strip, fg_color="#EAF0FC", corner_radius=12)
-        badge.pack(side="left", padx=(0, 8))
-        label(badge, "中  ⇄  EN", 12, ACCENT, bold=True).pack(padx=10, pady=6)
         self.action = label(strip, "", 12, SUB, anchor="w")
         self.action.pack(side="left", fill="x", expand=True, padx=(0, 5))
         self.live_link = button(strip, "回到录制", lambda: self.select_session(self.session_id), 68, fill=SELECT)
@@ -662,7 +674,6 @@ class InterpreterWindow(ctk.CTk):
             self.settings_page = self.settings_tab = self.archive_list = None
             self.archive_rows.clear()
             self.archive_row_updates.clear()
-            self.zoom_slider = None
 
     def _escape(self, _event):
         if self.row_menu is not None:
@@ -1256,6 +1267,7 @@ class InterpreterWindow(ctk.CTk):
         self.options = [device_menu]
 
         services = sections["翻译服务"][1]
+        label(services, "翻译方向 · 中英自动互译", 12, SUB).pack(anchor="w", padx=3, pady=(9, 2))
         caption(services, "API 优先级")
         order_box = ctk.CTkFrame(services, fg_color=SIDE, corner_radius=8)
         order_box.pack(fill="x", padx=3)
@@ -1304,7 +1316,6 @@ class InterpreterWindow(ctk.CTk):
             control.pack(fill="x", padx=3, pady=(4, 7))
             return control
 
-        self.zoom_slider = slider_row("字幕字号", self.zoom_label, (70, 180), 11, self.zoom_percent, self.set_subtitle_zoom)
         ctk.CTkSwitch(appearance, text="显示桌面悬浮球", variable=self.float_enabled, command=self.update_overlay,
                       text_color=SUB, font=font(12), progress_color=ACCENT).pack(anchor="w", padx=3, pady=(8, 2))
         slider_row("悬浮球不透明度", self.overlay_alpha_label, (55, 100), 9,
