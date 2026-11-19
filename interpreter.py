@@ -75,9 +75,9 @@ class HistoryStore:
             cursor = db.execute("INSERT INTO sessions(started,provider,title) VALUES (?,?,?)", (time.time(), provider, title))
             return cursor.lastrowid
 
-    def end(self, session_id: int):
+    def end(self, session_id: int, ended=None):
         with self.connect() as db:
-            db.execute("UPDATE sessions SET ended=? WHERE id=?", (time.time(), session_id))
+            db.execute("UPDATE sessions SET ended=? WHERE id=?", (time.time() if ended is None else ended, session_id))
 
     def resume(self, session_id: int):
         with self.connect() as db:
@@ -94,6 +94,13 @@ class HistoryStore:
     def segments(self, session_id: int):
         with self.connect() as db:
             return db.execute("SELECT started,ended,source,target FROM segments WHERE session_id=? ORDER BY id", (session_id,)).fetchall()
+
+    def last_translation(self, session_id: int):
+        with self.connect() as db:
+            return db.execute("""
+                SELECT source,target FROM segments WHERE session_id=? AND source<>'' AND target<>''
+                ORDER BY id DESC LIMIT 1
+            """, (session_id,)).fetchone()
 
     def session(self, session_id: int):
         with self.connect() as db:

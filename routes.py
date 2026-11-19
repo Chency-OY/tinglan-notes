@@ -6,20 +6,23 @@ import queue
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 
 import httpx
+import numpy as np
 import websocket
 
-from interpreter import FRAME_SAMPLES, SAMPLE_RATE, Segmenter, tencent_url, wav_bytes
+from interpreter import FRAME_SAMPLES, SAMPLE_RATE, tencent_url, wav_bytes
 
 PROVIDERS = ("DeepSeek", "Kimi 订阅", "腾讯云")
 KEYS = {"DeepSeek": ("deepseek_key",), "Kimi 订阅": ("kimi_key",),
         "腾讯云": ("tencent_appid", "tencent_id", "tencent_key")}
-PROMPT = ("Translate the following speech into the opposite language: Chinese to English or "
-          "English to Simplified Chinese. Return only the translation, preserving names and meaning.")
+PROMPT = ("Interpret the latest transcript from Chinese into English or English into Simplified Chinese. "
+          "Previous turns are context only: maintain the same terminology and resolve references across "
+          "segments. Translate only the latest turn. Preserve numbers, names, qualifications and negations. "
+          "Do not summarize, repeat earlier material or invent missing words. Return only the translation.")
+MINUTE_BYTES = 60 * SAMPLE_RATE * 2
 WHISPER_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "whisper"
 
 
@@ -40,7 +43,7 @@ def local_transcript(pcm):
         subprocess.run([str(exe.resolve()), "-m", str(model.resolve()), "-f", "-", "-l", "auto",
                         "-otxt", "-of", "segment", "-nt", "-np", "-t", "4"], input=wav_bytes(pcm),
                        cwd=tmp, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
-                       timeout=25, check=True)
+                       timeout=90, check=True)
         return (Path(tmp) / "segment.txt").read_text(encoding="utf-8-sig").strip()
 
 
@@ -71,12 +74,16 @@ def tencent_segment(pcm, keys):
         ws.close()
 
 
-def translate_text(client, provider, key, source):
+def translate_text(client, provider, key, source, previous=None):
     kimi = provider == "Kimi 订阅"
     url = ("https://api.kimi.com/coding/v1/chat/completions" if kimi else
            "https://api.deepseek.com/chat/completions")
-    body = {"model": "kimi-for-coding" if kimi else "deepseek-flash",
-            "messages": [{"role": "system", "content": PROMPT}, {"role": "user", "content": source}]}
+    messages = [{"role": "system", "content": PROMPT}]
+    if previous:
+        messages.extend([{"role": "user", "content": previous[0][-900:]},
+                         {"role": "assistant", "content": previous[1][-900:]}])
+    messages.append({"role": "user", "content": source})
+    body = {"model": "kimi-for-coding" if kimi else "deepseek-flash", "messages": messages}
     if not kimi:
         body["thinking"] = {"type": "disabled"}
     reply = client.post(url, headers={"Authorization": f"Bearer {key}",
@@ -88,7 +95,7 @@ def translate_text(client, provider, key, source):
     return text
 
 
-def translate_segment(client, pcm, routes, keys, notify):
+def translate_segment(client, pcm, routes, keys, notify, previous=None):
     source = ""
     failures = []
     for name in routes:
@@ -96,7 +103,7 @@ def translate_segment(client, pcm, routes, keys, notify):
             if name == "腾讯云":
                 original, target = tencent_segment(pcm, keys)
                 source = original or source
-                if source and not target:
+                if not original or not target:
                     raise ValueError("空译文")
             else:
                 if not source and name == "Kimi 订阅":
@@ -108,9 +115,9 @@ def translate_segment(client, pcm, routes, keys, notify):
                     r.raise_for_status()
                     source = r.json()["text"].strip()
                 if not source:
-                    return "", ""
+                    raise ValueError("未识别到文字")
                 notify(("source", source))
-                target = translate_text(client, name, keys[KEYS[name][0]], source)
+                target = translate_text(client, name, keys[KEYS[name][0]], source, previous)
             if failures:
                 notify(("status", f"{'，'.join(failures)} · 本段已切换至 {name}"))
             else:
@@ -124,41 +131,52 @@ def translate_segment(client, pcm, routes, keys, notify):
     return source, ""
 
 
+def minute_boundary(buffer):
+    """At the minute mark, prefer the end of a quiet 200 ms interval near the boundary."""
+    window = SAMPLE_RATE // 5
+    lookback = 3 * SAMPLE_RATE
+    samples = np.frombuffer(buffer, dtype="<i2", count=lookback, offset=MINUTE_BYTES - 2 * lookback)
+    blocks = samples.astype(np.float32).reshape(-1, window)
+    rms = np.sqrt(np.mean(blocks * blocks, axis=1))
+    threshold = min(120., max(8., np.max(rms) * .12))
+    quiet = np.flatnonzero(rms <= threshold)
+    if quiet.size:
+        return MINUTE_BYTES - (len(rms) - 1 - int(quiet[-1])) * window * 2
+    return MINUTE_BYTES
+
+
+def minute_batches(app):
+    # The microphone callback keeps queuing frames while the consumer is contacting a provider.
+    buffer = bytearray()
+    total_bytes = 0
+    while not app.stop_event.is_set() or not app.audio.empty():
+        try:
+            buffer.extend(app.audio.get(timeout=.1))
+        except queue.Empty:
+            continue
+        while len(buffer) >= MINUTE_BYTES:
+            cut = minute_boundary(buffer)
+            pcm = bytes(buffer[:cut])
+            del buffer[:cut]
+            yield pcm, total_bytes
+            total_bytes += cut
+    if buffer:
+        yield bytes(buffer), total_bytes
+
+
 def priority_loop(app):
-    """Segment on the capture clock and drain queued speech before ending the session."""
     sid = app.session_id
-    keys, routes = app.route_keys, app.active_routes
-    jobs = queue.Queue(maxsize=12)
-    def process():
-        with httpx.Client(timeout=httpx.Timeout(30., connect=8.)) as client:
-            while True:
-                job = jobs.get()
-                if job is None:
-                    break
-                pcm, start, end = job
-                source, target = translate_segment(client, pcm, routes, keys, app.events.put)
-                if source or target:
-                    app.events.put(("final_pair", start, end, source, target, sid))
-    worker = threading.Thread(target=process, daemon=True)
-    worker.start()
-    segmenter = Segmenter()
-    end = app.capture_started
-    def enqueue(pcm, *, drain=False):
-        if pcm:
-            job = (pcm, end - len(pcm) / (SAMPLE_RATE * 2), end)
-            try:
-                jobs.put(job, block=drain)
-            except queue.Full:
-                app.events.put(("status", "翻译排队已满，已跳过一段"))
-    try:
-        while not app.stop_event.is_set() or not app.audio.empty():
-            try:
-                frame = app.audio.get(timeout=.1)
-            except queue.Empty:
+    previous = app.history_store.last_translation(sid)
+    with httpx.Client(timeout=httpx.Timeout(90., connect=8.)) as client:
+        for pcm, offset in minute_batches(app):
+            if not any(pcm):
                 continue
-            end += len(frame) / (SAMPLE_RATE * 2)
-            enqueue(segmenter.feed(frame))
-        enqueue(segmenter.flush(), drain=True)
-    finally:
-        jobs.put(None)
-        worker.join()
+            start = app.capture_started + offset / (2 * SAMPLE_RATE)
+            end = app.capture_started + (offset + len(pcm)) / (2 * SAMPLE_RATE)
+            app.events.put(("status", "正在识别和翻译本段…"))
+            source, target = translate_segment(client, pcm, app.active_routes, app.route_keys,
+                                               app.events.put, previous)
+            if source or target:
+                app.events.put(("final_pair", start, end, source, target, sid))
+            if source and target:
+                previous = (source, target)

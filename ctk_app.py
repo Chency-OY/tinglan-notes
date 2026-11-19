@@ -187,6 +187,7 @@ class InterpreterWindow(ctk.CTk):
         self.zoom = 1.
         self.worker = self.stream = None
         self.capture_started = 0.
+        self.capture_ended = None
         self.stop_event = threading.Event()
         self.events = queue.Queue()
         self.audio = queue.Queue(maxsize=100)
@@ -194,7 +195,7 @@ class InterpreterWindow(ctk.CTk):
         self.titled_sessions = set()
         self.devices = {f"{i} · {d['name']}": i for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0}
         self.device = ctk.StringVar(value=next(iter(self.devices), "无可用麦克风"))
-        self.mode = ctk.StringVar(value=self.history_store.preference("mode", "按 API 优先级"))
+        self.mode = ctk.StringVar(value=self.history_store.preference("translation_cadence", "每分钟翻译"))
         self.status = ctk.StringVar(value="")
         portrait = Image.open(ASSETS / "icon.png").convert("RGBA")
         self.orbs = [orb_image(portrait, active) for active in (False, True)]
@@ -471,7 +472,7 @@ class InterpreterWindow(ctk.CTk):
         def caption(text):
             label(form, text, 11, SUB).pack(anchor="w", padx=4, pady=(12, 4))
         self.options = []
-        for name, var, values in (("录制模式", self.mode, ["按 API 优先级", "腾讯云 实时"]),
+        for name, var, values in (("录制模式", self.mode, ["每分钟翻译", "腾讯云 实时"]),
                                    ("麦克风", self.device, list(self.devices) or ["无可用麦克风"])):
             caption(name)
             menu = ctk.CTkOptionMenu(form, variable=var, values=values, width=110, dynamic_resizing=False,
@@ -541,7 +542,7 @@ class InterpreterWindow(ctk.CTk):
             return
         self.priority = list(self.pending_priority)
         self.history_store.set_preference("priority", "|".join(self.priority))
-        self.history_store.set_preference("mode", self.mode.get())
+        self.history_store.set_preference("translation_cadence", self.mode.get())
         self.history_store.set_preference("overlay", str(int(self.float_enabled.get())))
         self.set_panel(self.before_settings)
         self.status.set("设置已保存")
@@ -646,8 +647,7 @@ class InterpreterWindow(ctk.CTk):
         if self.closing:
             return
         if self.recording:
-            self.stop_event.set()
-            self._close_stream()
+            self._stop_capture()
             self._dock_state()
             self.status.set("正在保存最后一段…")
             return
@@ -665,11 +665,13 @@ class InterpreterWindow(ctk.CTk):
             if self.panel != "settings":
                 self.toggle_settings()
             return
-        self.audio = queue.Queue(maxsize=100)
+        self.audio = queue.Queue(maxsize=100) if realtime else queue.SimpleQueue()
         self.stop_event.clear()
+        self.capture_ended = None
         try:
             self.stream = sd.RawInputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
                                            blocksize=FRAME_SAMPLES, device=self.devices[self.device.get()], callback=self.capture)
+            self.capture_started = time.time()
             self.stream.start()
             if self.view_id is None:
                 sid = self.history_store.begin(self.active_routes[0], self.draft_title or None)
@@ -684,8 +686,7 @@ class InterpreterWindow(ctk.CTk):
         self.session_id = sid
         self.recording = True
         self.partial = ("", "")
-        self.capture_started = time.time()
-        self.status.set("正在收音")
+        self.status.set("正在收音" if realtime else "正在收音 · 每分钟翻译，暂停时提交末段")
         self._select(sid)
         self.update_overlay()
         if self.panel == "settings":
@@ -702,6 +703,14 @@ class InterpreterWindow(ctk.CTk):
             self.events.put(("status", f"录制中断 · {type(exc).__name__}"))
         finally:
             self.events.put(("finished",))
+
+    def _stop_capture(self):
+        if self.capture_ended is None:
+            self.capture_ended = time.time()
+        try:
+            self._close_stream()
+        finally:
+            self.stop_event.set()
 
     def _close_stream(self):
         if self.stream is not None:
@@ -734,7 +743,7 @@ class InterpreterWindow(ctk.CTk):
                 self.status.set(e[1])
             elif e[0] == "finished":
                 self._close_stream()
-                self.history_store.end(self.session_id)
+                self.history_store.end(self.session_id, self.capture_ended)
                 self.recording = False
                 self.route_keys.clear()
                 had_partial = any(self.partial)
@@ -757,8 +766,7 @@ class InterpreterWindow(ctk.CTk):
     def close(self):
         self.closing = True
         if self.recording:
-            self.stop_event.set()
-            self._close_stream()
+            self._stop_capture()
             self._dock_state()
             self.status.set("正在保存最后一段…")
         else:
