@@ -237,72 +237,35 @@ class RecordOrb(tk.Canvas):
             self.invoke()
 
 
-class OverlayTicker(ctk.CTkFrame):
-    """A single line that scrolls only when the latest translation does not fit."""
+class OverlayCaption(ctk.CTkFrame):
+    """Show one translated segment in a static, wrapped card."""
 
-    WIDTH = 316
-    HEIGHT = 29
+    WIDTH = 460
 
-    def __init__(self, parent, chroma, scale, y):
-        fill = "#F0F4FC"
-        super().__init__(parent, width=self.WIDTH, height=self.HEIGHT, fg_color=fill, bg_color=chroma,
-                         border_width=1, border_color="#CFDBF3", corner_radius=10)
-        self.pack_propagate(False)
+    def __init__(self, parent, chroma, scale):
+        fill = "#F9FAFE"
+        super().__init__(parent, fg_color=fill, bg_color=chroma, border_width=1,
+                         border_color=BORDER, corner_radius=14)
         self.scale = scale
-        self.y = y / scale
-        padding = round(9 * scale)
-        self.inner_width = round(self.WIDTH * scale) - 2 * padding
-        height = round(20 * scale)
-        self.canvas = tk.Canvas(self, width=self.inner_width, height=height, bg=fill, borderwidth=0, highlightthickness=0)
-        self.canvas.pack(expand=True, padx=padding)
-        self.line = self.canvas.create_text(0, height // 2, anchor="w", fill=INK,
-                                            font=(FONT, -round(13 * scale)), text="")
-        self.text = ""
-        self.offset = 0.
-        self.travel = 0
-        self.timer = None
+        self.pad_x = round(16 * scale)
+        self.pad_y = round(10 * scale)
+        self.body = tk.Label(self, bg=fill, fg=INK, anchor="nw", justify="left",
+                             borderwidth=0, padx=0, pady=0)
 
-    def _cancel_timer(self):
-        if self.timer is not None:
-            self.after_cancel(self.timer)
-            self.timer = None
-
-    def show(self, text):
-        text = " ".join(text.split())
-        if text == self.text:
-            return
-        self.text = text
-        self._cancel_timer()
-        if not text:
-            self.place_forget()
-            return
-        self.canvas.itemconfigure(self.line, text=text)
-        self.canvas.coords(self.line, 0, round(10 * self.scale))
-        left, _, right, _ = self.canvas.bbox(self.line)
-        length = right - left
-        self.travel = max(0, length - self.inner_width)
-        self.offset = 0.
-        self.place(x=0, y=self.y)
-        if self.travel:
-            self.speed = min(88 * self.scale, max(47 * self.scale, self.travel / 9))
-            self.timer = self.after(850, self._advance)
-        else:
-            self.canvas.move(self.line, (self.inner_width - length) / 2, 0)
-
-    def _advance(self):
-        self.timer = None
-        if self.offset >= self.travel:
-            self.offset = 0.
-            delay = 850
-        else:
-            self.offset = min(self.travel, self.offset + self.speed * .04)
-            delay = 1150 if self.offset == self.travel else 40
-        self.canvas.coords(self.line, -self.offset, round(10 * self.scale))
-        self.timer = self.after(delay, self._advance)
-
-    def destroy(self):
-        self._cancel_timer()
-        super().destroy()
+    def show(self, text, width, max_height, y):
+        text_width = max(1, width - 2 * self.pad_x)
+        self.body.configure(text=text, wraplength=text_width)
+        for size in range(16, 11, -1):
+            self.body.configure(font=(FONT, -round(size * self.scale)))
+            height = self.body.winfo_reqheight() + 2 * self.pad_y
+            if height <= max_height:
+                break
+        height = min(height, max_height)
+        self.configure(width=width / self.scale, height=height / self.scale)
+        self.body.place(x=self.pad_x, y=self.pad_y, width=text_width,
+                        height=max(1, height - 2 * self.pad_y))
+        self.place(x=0, y=y / self.scale)
+        return height
 
 
 class RecordingRun:
@@ -356,7 +319,9 @@ class InterpreterWindow(ctk.CTk):
         self.history_store = history_store or HistoryStore()
         self.priority = priority_order(self.history_store.preference("priority", ""))
         self.float_enabled = ctk.BooleanVar(value=self.history_store.preference("overlay", "1") == "1")
-        self.overlay = self.overlay_ticker = None
+        self.overlay_caption_enabled = self.history_store.preference("overlay_caption", "1") == "1"
+        self.overlay = self.overlay_caption = None
+        self.overlay_menu = None
         self.overlay_subtitle = ""
         self.ball_position = self._load_ball_position()
         self.overlay_alpha_percent = self._bounded_preference("overlay_alpha", 90, 55, 100)
@@ -588,14 +553,139 @@ class InterpreterWindow(ctk.CTk):
             self.history_store.set_preference("overlay_position", f"{x},{y}")
 
     def close_overlay(self):
+        self._close_overlay_menu()
         if self.overlay is not None:
             self.overlay.destroy()
-            self.overlay = self.overlay_ticker = None
+            self.overlay = self.overlay_caption = None
+
+    def hide_overlay(self):
+        self.history_store.set_preference("overlay", "0")
+        self.float_enabled.set(False)
+        self.update_overlay()
+
+    def toggle_overlay_caption(self):
+        self.overlay_caption_enabled = not self.overlay_caption_enabled
+        self.history_store.set_preference("overlay_caption", str(int(self.overlay_caption_enabled)))
+        if self.overlay is not None:
+            self._place_overlay(*self.ball_position)
+
+    def _close_overlay_menu(self):
+        if self.overlay_menu is not None:
+            menu, self.overlay_menu = self.overlay_menu, None
+            menu.destroy()
+
+    def _show_overlay_menu(self, event):
+        if self.closing:
+            return
+        self._close_overlay_menu()
+        surface = "#FFFFFF"
+        chroma = "#FF00FF" if sys.platform == "win32" else surface
+        menu = self.overlay_menu = tk.Toplevel(self.overlay, background=chroma)
+        menu.withdraw()
+        menu.overrideredirect(True)
+        menu.attributes("-topmost", True)
+        if sys.platform == "win32":
+            menu.attributes("-toolwindow", True)
+            menu.attributes("-transparentcolor", chroma)
+
+        card = ctk.CTkFrame(menu, bg_color=chroma, fg_color=surface, border_color=BORDER,
+                            border_width=1, corner_radius=14)
+        card.pack(fill="both", expand=True)
+        caption_action = "隐藏字幕" if self.overlay_caption_enabled else "显示字幕"
+        choices = ((caption_action, self.toggle_overlay_caption, INK, "#EEF2FB"),
+                   ("关闭悬浮球", self.hide_overlay, INK, "#EEF2FB"),
+                   ("退出", self.close, "#A24460", "#FAEDF2"))
+
+        def activate(command):
+            self._close_overlay_menu()
+            command()
+
+        controls = []
+        for text, command, color, hover in choices:
+            control = ctk.CTkButton(card, text=text, command=lambda run=command: activate(run),
+                                    width=184, height=46, corner_radius=9, border_spacing=13,
+                                    anchor="w", fg_color="transparent", hover_color=hover,
+                                    text_color=color, font=font(17))
+            control.pack(fill="x", padx=6, pady=(6 if not controls else 2, 4))
+            controls.append(control)
+
+        selected = None
+
+        def select(step):
+            nonlocal selected
+            selected = (0 if step > 0 else len(controls) - 1) if selected is None else (selected + step) % len(controls)
+            for index, control in enumerate(controls):
+                control.configure(fg_color=choices[index][3] if selected == index else "transparent")
+            return "break"
+
+        def invoke_selected(_event):
+            if selected is not None:
+                controls[selected].invoke()
+            return "break"
+
+        def dismiss(_event):
+            self._close_overlay_menu()
+            return "break"
+
+        def dismiss_outside(event):
+            if self.overlay_menu is not menu:
+                return
+            left, top = menu.winfo_rootx(), menu.winfo_rooty()
+            if not (left <= event.x_root < left + menu.winfo_width()
+                    and top <= event.y_root < top + menu.winfo_height()):
+                return dismiss(event)
+
+        menu.bind("<ButtonPress-1>", dismiss_outside)
+        menu.bind("<ButtonPress-3>", dismiss_outside)
+        menu.bind("<FocusOut>", dismiss)
+        menu.bind("<Escape>", dismiss)
+        menu.bind("<Up>", lambda _: select(-1))
+        menu.bind("<Down>", lambda _: select(1))
+        menu.bind("<Return>", invoke_selected)
+
+        menu.update_idletasks()
+        width, height = menu.winfo_reqwidth(), menu.winfo_reqheight()
+        margin = round(8 * card._get_widget_scaling())
+        left, top, right, bottom = monitor_work_area(self, (event.x_root, event.y_root))
+        x = max(left, min(event.x_root + margin, right - width - margin))
+        y = event.y_root + margin
+        if y + height > bottom:
+            y = max(top, event.y_root - height - margin)
+        menu.geometry(f"{width}x{height}+{max(0, x)}+{max(0, y)}")
+        menu.deiconify()
+        menu.update_idletasks()
+        move_overlay_window(menu, x, y)
+        menu.focus_force()
+        menu.grab_set()
 
     def _show_overlay_translation(self, text):
+        text = text.strip()
+        if text == self.overlay_subtitle:
+            return
         self.overlay_subtitle = text
-        if self.overlay_ticker is not None:
-            self.overlay_ticker.show(text)
+        if self.overlay is not None and self.overlay_caption_enabled:
+            self._place_overlay(*self.ball_position)
+
+    def _place_overlay(self, x, y):
+        win = self.overlay
+        caption = self.overlay_caption
+        scale = caption.scale
+        size = self.float_canvas.winfo_reqwidth()
+        left, top, right, bottom = monitor_work_area(self, (x, y))
+        x = max(left, min(right - size, x))
+        width = height = size
+        caption_y = size + round(6 * scale)
+        if self.overlay_caption_enabled and self.overlay_subtitle and bottom - top > caption_y:
+            width = min(round(caption.WIDTH * scale), right - left)
+            height = caption_y + caption.show(self.overlay_subtitle, width, bottom - top - caption_y, caption_y)
+        else:
+            caption.place_forget()
+        base = max(left, min(right - width, x + (size - width) // 2))
+        displayed_y = max(top, min(bottom - height, y))
+        self.float_canvas.place(x=x - base, y=0)
+        win.geometry(f"{width}x{height}")
+        move_overlay_window(win, base, displayed_y)
+        return x, max(top, min(bottom - size, y))
 
     def update_overlay(self):
         if not self.float_enabled.get():
@@ -615,23 +705,10 @@ class InterpreterWindow(ctk.CTk):
         win.attributes("-topmost", True)
         scale = self.main._get_widget_scaling()
         size = round(60 * scale)
-        ticker_y = size + round(4 * scale)
-        width = round(OverlayTicker.WIDTH * scale)
-        height = ticker_y + round(OverlayTicker.HEIGHT * scale)
-        self.overlay_ticker = OverlayTicker(win, chroma, scale, ticker_y)
-
-        def settle(x, y):
-            left, top, right, bottom = monitor_work_area(self, (x, y))
-            x = max(left, min(right - size, x))
-            y = max(top, min(bottom - height, y))
-            base = max(left, min(right - width, x + size - width))
-            return x, y, base
+        self.overlay_caption = OverlayCaption(win, chroma, scale)
 
         def move_to(x, y):
-            x, y, base = settle(x, y)
-            self.ball_position = (x, y)
-            self.float_canvas.place_configure(x=x - base)
-            move_overlay_window(win, base, y)
+            self.ball_position = self._place_overlay(x, y)
 
         def click():
             if self.closing:
@@ -643,21 +720,16 @@ class InterpreterWindow(ctk.CTk):
                 self.lift()
 
         self.float_canvas = RecordOrb(win, self.orbs, scale, chroma, click, move_to, self._remember_ball_position)
+        self.float_canvas.bind("<ButtonRelease-3>", self._show_overlay_menu)
         self.float_canvas.set_state(self.recording or self.start_request is not None, not self.closing)
         if self.ball_position is None:
             left, top, right, bottom = monitor_work_area(self)
             margin = round(12 * scale)
-            position = max(left, right - size - margin), max(top, bottom - height - margin)
-        else:
-            position = self.ball_position
-        x, y, base = settle(*position)
-        self.ball_position = (x, y)
-        self.float_canvas.place(x=x - base, y=0)
-        self.overlay_ticker.show(self.overlay_subtitle)
-        win.geometry(f"{width}x{height}+{max(0, base)}+{max(0, y)}")
+            self.ball_position = max(left, right - size - margin), max(top, bottom - size - margin)
+        self.ball_position = self._place_overlay(*self.ball_position)
         win.deiconify()
         win.update_idletasks()
-        move_overlay_window(win, base, y)
+        self._place_overlay(*self.ball_position)
 
     def toggle_settings(self):
         if self.settings_page is not None:

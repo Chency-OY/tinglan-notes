@@ -1,0 +1,69 @@
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from ctk_app import FONT, InterpreterWindow, monitor_work_area
+from interpreter import HistoryStore
+
+
+class OverlayCaptionTests(unittest.TestCase):
+    def test_wrapped_segment_and_persistent_right_click_visibility(self):
+        with tempfile.TemporaryDirectory() as folder, patch("ctk_app.sd.query_devices", return_value=[]):
+            store = HistoryStore(Path(folder) / "test.db")
+            app = InterpreterWindow(store)
+            try:
+                app.update()
+                orb = app.float_canvas
+                caption = app.overlay_caption
+                self.assertFalse(caption.winfo_ismapped())
+
+                def caption_action():
+                    orb.event_generate("<ButtonRelease-3>", x=10, y=10,
+                                       rootx=orb.winfo_rootx() + 10, rooty=orb.winfo_rooty() + 10)
+                    app.update()
+                    card, = app.overlay_menu.winfo_children()
+                    return next(button for button in card.winfo_children() if hasattr(button, "invoke"))
+
+                segment = "这是字幕换行测试。 " * 14 + "The complete translation stays in one card."
+                app._show_overlay_translation(segment)
+                app.update()
+                body = caption.body
+                self.assertEqual(body.cget("text"), segment)
+                self.assertGreater(body.winfo_height(), 2 * round(16 * caption.scale))
+                self.assertEqual(body.cget("font"), f"{{{FONT}}} {-round(16 * caption.scale)}")
+                self.assertEqual(body.winfo_height(), body.winfo_reqheight())
+                self.assertGreaterEqual(caption.winfo_rooty(), orb.winfo_rooty() + orb.winfo_height())
+                left, top, right, bottom = monitor_work_area(app, app.ball_position)
+                self.assertGreaterEqual(app.overlay.winfo_rootx(), left)
+                self.assertGreaterEqual(app.overlay.winfo_rooty(), top)
+                self.assertLessEqual(app.overlay.winfo_rootx() + app.overlay.winfo_width(), right)
+                self.assertLessEqual(app.overlay.winfo_rooty() + app.overlay.winfo_height(), bottom)
+
+                action = caption_action()
+                self.assertEqual(action.cget("text"), "隐藏字幕")
+                action.invoke()
+                app.update()
+                self.assertFalse(caption.winfo_ismapped())
+                self.assertTrue(orb.winfo_ismapped())
+                self.assertEqual(store.preference("overlay_caption", "1"), "0")
+
+                app._show_overlay_translation("下一段译文")
+                app.update()
+                self.assertFalse(caption.winfo_ismapped())
+                action = caption_action()
+                self.assertEqual(action.cget("text"), "显示字幕")
+                action.invoke()
+                app.update()
+                self.assertTrue(caption.winfo_ismapped())
+                self.assertEqual(body.cget("text"), "下一段译文")
+                self.assertEqual(store.preference("overlay_caption", "0"), "1")
+
+                app._show_overlay_translation("")
+                app.update()
+                self.assertFalse(caption.winfo_ismapped())
+            finally:
+                app.close_overlay()
+                for callback in app.tk.splitlist(app.tk.call("after", "info")):
+                    app.after_cancel(callback)
+                app.destroy()
