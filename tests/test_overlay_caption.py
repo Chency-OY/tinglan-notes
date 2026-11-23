@@ -25,6 +25,18 @@ class OverlayCaptionTests(unittest.TestCase):
                     card, = app.overlay_menu.winfo_children()
                     return next(button for button in card.winfo_children() if hasattr(button, "invoke"))
 
+                def click_caption_action(action, *, move_focus=False):
+                    menu = app.overlay_menu
+                    if move_focus:
+                        app.focus_force()
+                        app.update()
+                    self.assertIs(app.overlay_menu, menu)
+                    # Click the row away from its text, even if the grab targets the popup itself.
+                    x = action.winfo_rootx() + action.winfo_width() - 12
+                    y = action.winfo_rooty() + action.winfo_height() // 2
+                    menu.event_generate("<ButtonPress-1>", rootx=x, rooty=y)
+                    self.assertIsNone(app.overlay_menu)
+
                 segment = "这是字幕换行测试。 " * 14 + "The complete translation stays in one card."
                 app._show_overlay_translation(segment)
                 app.update()
@@ -42,7 +54,7 @@ class OverlayCaptionTests(unittest.TestCase):
 
                 action = caption_action()
                 self.assertEqual(action.cget("text"), "隐藏字幕")
-                action.invoke()
+                click_caption_action(action, move_focus=True)
                 app.update()
                 self.assertFalse(caption.winfo_ismapped())
                 self.assertTrue(orb.winfo_ismapped())
@@ -53,7 +65,7 @@ class OverlayCaptionTests(unittest.TestCase):
                 self.assertFalse(caption.winfo_ismapped())
                 action = caption_action()
                 self.assertEqual(action.cget("text"), "显示字幕")
-                action.invoke()
+                click_caption_action(action)
                 app.update()
                 self.assertTrue(caption.winfo_ismapped())
                 self.assertEqual(body.cget("text"), "下一段译文")

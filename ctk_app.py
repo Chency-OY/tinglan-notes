@@ -627,7 +627,7 @@ class InterpreterWindow(ctk.CTk):
             self._close_overlay_menu()
             return "break"
 
-        def dismiss_outside(event):
+        def handle_press(event):
             if self.overlay_menu is not menu:
                 return
             left, top = menu.winfo_rootx(), menu.winfo_rooty()
@@ -635,9 +635,22 @@ class InterpreterWindow(ctk.CTk):
                     and top <= event.y_root < top + menu.winfo_height()):
                 return dismiss(event)
 
-        menu.bind("<ButtonPress-1>", dismiss_outside)
-        menu.bind("<ButtonPress-3>", dismiss_outside)
-        menu.bind("<FocusOut>", dismiss)
+            if event.num == 1:
+                for control in controls:
+                    x, y = control.winfo_rootx(), control.winfo_rooty()
+                    if (x <= event.x_root < x + control.winfo_width()
+                            and y <= event.y_root < y + control.winfo_height()):
+                        control.invoke()
+                        return "break"
+
+        def dismiss_if_inactive():
+            if self.overlay_menu is menu and menu.focus_displayof() is None:
+                self._close_overlay_menu()
+
+        menu.bind("<ButtonPress-1>", handle_press)
+        menu.bind("<ButtonPress-3>", handle_press)
+        # Focus can move within the app before Windows delivers a click to the popup's grab.
+        menu.bind("<FocusOut>", lambda _: menu.after_idle(dismiss_if_inactive))
         menu.bind("<Escape>", dismiss)
         menu.bind("<Up>", lambda _: select(-1))
         menu.bind("<Down>", lambda _: select(1))
