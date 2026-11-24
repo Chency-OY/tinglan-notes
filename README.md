@@ -29,7 +29,7 @@ python ctk_app.py
 
 ```powershell
 python -m pip install pyinstaller
-python -m PyInstaller --onefile --windowed --icon icon.ico --add-data "icon.ico;." --add-data "icon.png;." --add-data "whisper;whisper" --add-data "third_party;third_party" --name ZhEnInterpreter --collect-all sounddevice --collect-all keyring --collect-all customtkinter ctk_app.py
+python -m PyInstaller --clean --noconfirm ZhEnInterpreter.spec
 ```
 
 打包前先运行上面的 prepare_whisper.py 获取固定版本的 Windows x64 组件和多语言模型。生成文件位于 `dist/ZhEnInterpreter.exe`。
