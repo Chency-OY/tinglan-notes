@@ -111,6 +111,17 @@ def button(parent, text, command, width=32, *, symbol=False, fill="transparent",
                          anchor=anchor, font=font(16 if symbol else 12, family="Segoe MDL2 Assets" if symbol else FONT))
 
 
+def translation_indicator(enabled):
+    image = Image.new("RGBA", (40, 40))
+    draw = ImageDraw.Draw(image)
+    bounds = (2, 2, 37, 37)
+    if enabled:
+        draw.ellipse(bounds, fill="#27935E")
+    else:
+        draw.ellipse(bounds, outline="#8794A6", width=4)
+    return ctk.CTkImage(light_image=image, size=(10, 10))
+
+
 def orb_image(portrait, recording):
     # Supersample the portrait, surrounding ring and small play/pause badge as one button.
     size = 240
@@ -395,7 +406,7 @@ class InterpreterWindow(ctk.CTk):
         self.capture_source = source if source in self.capture_sources else default_source
         self.translate_recording = self.history_store.preference("translate_recording", "1") == "1"
         self.source_setting = tk.StringVar(self, self.capture_sources[self.capture_source])
-        self.translation_setting = tk.IntVar(self, int(self.translate_recording))
+        self.translation_icons = {state: translation_indicator(state) for state in (False, True)}
         self._build_dock()
         self._select(None)
         self.bind("<Control-MouseWheel>", self._zoom)
@@ -530,7 +541,7 @@ class InterpreterWindow(ctk.CTk):
         self.source_control.pack(anchor="w", pady=(2, 4))
         self.record_options = ctk.CTkFrame(strip, fg_color="transparent")
         self.record_options.pack(anchor="w")
-        self.mode_control = self._translation_switch(self.record_options)
+        self.mode_control = self._translation_toggle(self.record_options)
         self.mode_control.pack(side="left", padx=(0, 8))
         self.action = label(self.record_options, "", 11, SUB, anchor="w")
         self.action.pack(side="left")
@@ -551,20 +562,23 @@ class InterpreterWindow(ctk.CTk):
             unselected_color="#EEF2FB", unselected_hover_color="#E5ECF9",
             text_color=INK, text_color_disabled=MUTED)
 
-    def _translation_switch(self, parent):
-        return ctk.CTkSwitch(
-            parent, text="翻译", font=font(12), variable=self.translation_setting,
-            command=self._set_recording_mode, state=self._capture_controls_state(),
-            width=72, height=23, switch_width=36, switch_height=19, border_width=1,
-            fg_color="#B5C1D1", progress_color="#27935E", button_color="#FFFFFF",
-            button_hover_color="#F2F7F4", text_color=INK, text_color_disabled=MUTED)
+    def _translation_toggle(self, parent):
+        return ctk.CTkButton(
+            parent, text="翻译", font=font(12), image=self.translation_icons[self.translate_recording],
+            command=self._toggle_translation, state=self._capture_controls_state(),
+            compound="left", anchor="w", width=58, height=26, corner_radius=6, border_spacing=4,
+            fg_color="transparent", hover_color="#EEF2FB", text_color=INK, text_color_disabled=MUTED)
 
     def _set_capture_source(self, value):
         self.capture_source = next(source for source, label in self.capture_sources.items() if label == value)
         self.history_store.set_preference("capture_source", self.capture_source)
 
-    def _set_recording_mode(self):
-        self.translate_recording = bool(self.translation_setting.get())
+    def _toggle_translation(self):
+        self.translate_recording = not self.translate_recording
+        icon = self.translation_icons[self.translate_recording]
+        self.mode_control.configure(image=icon)
+        if self.overlay_recording_controls:
+            self.overlay_recording_controls[1].configure(image=icon)
         self.history_store.set_preference("translate_recording", str(int(self.translate_recording)))
 
     def _dock_state(self):
@@ -652,7 +666,7 @@ class InterpreterWindow(ctk.CTk):
         label(settings, "录制音源", 11, SUB, anchor="w").pack(anchor="w", padx=8, pady=(6, 3))
         source_control = self._capture_source_selector(settings)
         source_control.pack(fill="x", padx=8)
-        mode_control = self._translation_switch(settings)
+        mode_control = self._translation_toggle(settings)
         mode_control.pack(anchor="w", padx=8, pady=(6, 6))
         self.overlay_recording_controls = (source_control, mode_control)
 
@@ -677,7 +691,7 @@ class InterpreterWindow(ctk.CTk):
             controls.append(control)
 
         click_targets = [(segment, segment.invoke) for segment in source_control.grid_slaves(row=0)]
-        click_targets.append((mode_control, mode_control.toggle))
+        click_targets.append((mode_control, mode_control.invoke))
         click_targets.extend((control, control.invoke) for control in controls)
         selected = None
 
@@ -705,17 +719,15 @@ class InterpreterWindow(ctk.CTk):
                     and top <= event.y_root < top + menu.winfo_height()):
                 return dismiss(event)
 
-            if event.num == 1:
-                for control, invoke in click_targets:
-                    x, y = control.winfo_rootx(), control.winfo_rooty()
-                    if (x <= event.x_root < x + control.winfo_width()
-                            and y <= event.y_root < y + control.winfo_height()):
-                        # The control normally receives clicks on its child canvas or label.
-                        # A grab may instead deliver the press to the menu itself.
-                        if not str(event.widget).startswith(f"{control}."):
-                            invoke()
-                            return "break"
-                        return
+        def handle_release(event):
+            if self.overlay_menu is not menu:
+                return
+            for control, invoke in click_targets:
+                x, y = control.winfo_rootx(), control.winfo_rooty()
+                if (x <= event.x_root < x + control.winfo_width()
+                        and y <= event.y_root < y + control.winfo_height()):
+                    invoke()
+                    return "break"
 
         def dismiss_if_inactive():
             if self.overlay_menu is menu and menu.focus_displayof() is None:
@@ -723,6 +735,12 @@ class InterpreterWindow(ctk.CTk):
 
         menu.bind("<ButtonPress-1>", handle_press)
         menu.bind("<ButtonPress-3>", handle_press)
+        menu.bind("<ButtonRelease-1>", handle_release)
+        # Route both direct and grabbed clicks through the menu before child widget bindings.
+        menu_tag = str(menu)
+        for control, _ in click_targets:
+            for widget in (control, *control.winfo_children()):
+                widget.bindtags((menu_tag, *(tag for tag in widget.bindtags() if tag != menu_tag)))
         # Focus can move within the app before Windows delivers a click to the popup's grab.
         menu.bind("<FocusOut>", lambda _: menu.after_idle(dismiss_if_inactive))
         menu.bind("<Escape>", dismiss)

@@ -34,7 +34,7 @@ class OverlayCaptionTests(unittest.TestCase):
                     # Click the row away from its text, even if the grab targets the popup itself.
                     x = action.winfo_rootx() + action.winfo_width() - 12
                     y = action.winfo_rooty() + action.winfo_height() // 2
-                    menu.event_generate("<ButtonPress-1>", rootx=x, rooty=y)
+                    menu.event_generate("<ButtonRelease-1>", rootx=x, rooty=y)
                     self.assertIsNone(app.overlay_menu)
 
                 segment = "This sentence tests subtitle wrapping. " * 14 + "The complete translation stays in one card."
@@ -112,7 +112,7 @@ class OverlayCaptionTests(unittest.TestCase):
                 def click_via_grab(control):
                     x = control.winfo_rootx() + control.winfo_width() // 2
                     y = control.winfo_rooty() + control.winfo_height() // 2
-                    menu.event_generate("<ButtonPress-1>", rootx=x, rooty=y)
+                    menu.event_generate("<ButtonRelease-1>", rootx=x, rooty=y)
                     self.assertIs(app.overlay_menu, menu)
 
                 self.assertEqual(sources.get(), app.source_control.get())
@@ -127,18 +127,25 @@ class OverlayCaptionTests(unittest.TestCase):
                     microphone.invoke()
                     self.assertEqual(sources.get(), "麦克风")
 
-                self.assertEqual(translation.get(), 1)
+                on_icon = app.translation_icons[True]
+                off_icon = app.translation_icons[False]
+                self.assertIs(translation.cget("image"), on_icon)
+                self.assertEqual(on_icon.cget("size"), (10, 10))
+                self.assertEqual(on_icon.cget("light_image").getpixel((20, 20)), (39, 147, 94, 255))
+                self.assertEqual(off_icon.cget("light_image").getpixel((20, 20))[3], 0)
                 # A native click on the label must toggle only once, even with the menu grab.
-                switch_label = next(child for child in translation.winfo_children()
+                toggle_label = next(child for child in translation.winfo_children()
                                     if child.winfo_class() == "Label")
-                switch_label.event_generate("<ButtonPress-1>", x=1, y=1,
-                                            rootx=switch_label.winfo_rootx() + 1,
-                                            rooty=switch_label.winfo_rooty() + 1)
-                self.assertEqual(app.mode_control.get(), 0)
+                toggle_label.event_generate("<ButtonRelease-1>", x=1, y=1,
+                                            rootx=toggle_label.winfo_rootx() + 1,
+                                            rooty=toggle_label.winfo_rooty() + 1)
+                self.assertIs(app.mode_control.cget("image"), off_icon)
+                self.assertIs(translation.cget("image"), off_icon)
                 self.assertFalse(app.translate_recording)
                 self.assertEqual(store.preference("translate_recording", ""), "0")
                 click_via_grab(translation)
-                self.assertEqual(app.mode_control.get(), 1)
+                self.assertIs(app.mode_control.cget("image"), on_icon)
+                self.assertIs(translation.cget("image"), on_icon)
                 self.assertTrue(app.translate_recording)
 
                 app.recording = True
@@ -146,7 +153,8 @@ class OverlayCaptionTests(unittest.TestCase):
                 self.assertEqual(sources.cget("state"), "disabled")
                 self.assertEqual(translation.cget("state"), "disabled")
                 click_via_grab(translation)
-                self.assertEqual(app.mode_control.get(), 1)
+                self.assertIs(app.mode_control.cget("image"), on_icon)
+                self.assertIs(translation.cget("image"), on_icon)
             finally:
                 app.close_overlay()
                 for callback in app.tk.splitlist(app.tk.call("after", "info")):
