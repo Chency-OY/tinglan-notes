@@ -5,3 +5,5 @@ sounddevice==0.5.6
 customtkinter==6.0.0
 Pillow>=11.0.0
 webrtcvad-wheels==2.0.14.post1
+PyAudioWPatch==0.2.12.9; sys_platform == "win32"
+audioop-lts>=0.2.1; python_version >= "3.13" and sys_platform == "win32"

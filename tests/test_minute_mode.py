@@ -13,7 +13,7 @@ from routes import MINUTE_BYTES, speech_batches, priority_loop, translate_text
 
 def buffered_app(pcm):
     app = SimpleNamespace(audio=queue.SimpleQueue(), events=queue.SimpleQueue(), stop_event=threading.Event(),
-                          session_id=7, capture_started=100., route_keys={}, active_routes=["DeepSeek"],
+                          session_id=7, translation_enabled=True, capture_started=100., route_keys={}, active_routes=["DeepSeek"],
                           history_store=Mock(), previous_saved=None)
     for pos in range(0, len(pcm), FRAME_SAMPLES * 2):
         app.audio.put(pcm[pos:pos + FRAME_SAMPLES * 2])
@@ -86,6 +86,17 @@ class SpeechBatchTests(unittest.TestCase):
             if event[0] == "final_pair":
                 pairs.append(event)
         self.assertEqual([(e[1],e[2],e[5]) for e in pairs], [(100.,160.,7),(160.,163.,7)])
+
+    def test_transcription_only_saves_source_without_translation(self):
+        app = buffered_app(b"\x11\x01" * SAMPLE_RATE)
+        app.translation_enabled = False
+        with patch("routes.local_transcript", return_value="中文讲座笔记") as recognition, \
+             patch("routes.translate_segment") as translation:
+            priority_loop(app)
+        recognition.assert_called_once()
+        translation.assert_not_called()
+        events = list(iter(lambda: app.events.get_nowait() if not app.events.empty() else None, None))
+        self.assertIn(("final_pair", 100., 101., "中文讲座笔记", "", 7), events)
 
     def test_empty_exact_minute_and_digital_silence(self):
         self.assertEqual(list(speech_batches(buffered_app(b""))), [])

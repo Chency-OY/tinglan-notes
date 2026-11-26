@@ -157,14 +157,27 @@ def priority_loop(app):
     try:
         if app.previous_saved is not None:
             app.previous_saved.wait()
-        previous = app.history_store.last_translation(sid)
+        previous = app.history_store.last_translation(sid) if app.translation_enabled else None
         with httpx.Client(timeout=httpx.Timeout(90., connect=8.)) as client:
             for pcm, offset in iter(jobs.get, None):
                 start = app.capture_started + offset / (2 * SAMPLE_RATE)
                 end = app.capture_started + (offset + len(pcm)) / (2 * SAMPLE_RATE)
-                app.events.put(("status", "正在识别和翻译本段…"))
-                source, target = translate_segment(client, pcm, app.active_routes, app.route_keys,
-                                                   app.events.put, previous)
+                if app.translation_enabled:
+                    app.events.put(("status", "正在识别和翻译本段…"))
+                    source, target = translate_segment(client, pcm, app.active_routes, app.route_keys,
+                                                       app.events.put, previous)
+                else:
+                    app.events.put(("status", "正在本地转写本段…"))
+                    target = ""
+                    try:
+                        source = local_transcript(pcm)
+                    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                        reason = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__
+                        app.events.put(("status", f"本段转写失败 · {reason}"))
+                        continue
+                    if source.upper() == "[BLANK_AUDIO]":
+                        continue
+                    app.events.put(("status", "正在收音 · 本地转写"))
                 if source or target:
                     app.events.put(("final_pair", start, end, source, target, sid))
                 if source and target:

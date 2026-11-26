@@ -272,10 +272,11 @@ class RecordingRun:
     """Capture and worker state for one uninterrupted microphone interval."""
     capture = AudioBackend.capture
 
-    def __init__(self, history_store, keys, routes):
+    def __init__(self, history_store, keys, routes, translation_enabled):
         self.history_store = history_store
         self.route_keys = keys
         self.active_routes = routes
+        self.translation_enabled = translation_enabled
         self.audio = queue.SimpleQueue()
         self.events = queue.SimpleQueue()
         self.stop_event = threading.Event()
@@ -299,6 +300,8 @@ class CaptureStart:
     sid: int | None
     project_id: int | None
     title: str
+    source: str
+    translation_enabled: bool
     cancelled: threading.Event = field(default_factory=threading.Event)
     result: queue.SimpleQueue = field(default_factory=queue.SimpleQueue)
 
@@ -383,6 +386,9 @@ class InterpreterWindow(ctk.CTk):
         self.main.grid_rowconfigure(1, weight=1)
         self._build_header()
         self._build_feed()
+        source = self.history_store.preference("capture_source", "mic")
+        self.capture_source = "system" if sys.platform == "win32" and source == "system" else "mic"
+        self.translate_recording = self.history_store.preference("translate_recording", "1") == "1"
         self._build_dock()
         self._select(None)
         self.bind("<Control-MouseWheel>", self._zoom)
@@ -513,13 +519,39 @@ class InterpreterWindow(ctk.CTk):
         self.notice.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 3))
         strip = ctk.CTkFrame(dock, fg_color="transparent")
         strip.grid(row=1, column=0, sticky="ew", padx=(4, 6))
-        self.action = label(strip, "", 12, SUB, anchor="w")
-        self.action.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        controls = ctk.CTkFrame(strip, fg_color="transparent")
+        controls.pack(anchor="w", pady=(2, 4))
+        sources = ["麦克风", "系统声音"] if sys.platform == "win32" else ["麦克风"]
+        selector_style = dict(font=font(12), height=30, corner_radius=9,
+                              fg_color="#EEF2FB", selected_color=SELECT, selected_hover_color="#CCDAF4",
+                              unselected_color="#EEF2FB", unselected_hover_color="#E5ECF9",
+                              text_color=INK, text_color_disabled=MUTED)
+        self.source_control = ctk.CTkSegmentedButton(
+            controls, values=sources, command=self._set_capture_source, **selector_style)
+        self.source_control.set("系统声音" if self.capture_source == "system" else "麦克风")
+        self.source_control.pack(side="left")
+        self.mode_control = ctk.CTkSegmentedButton(
+            controls, values=["同传", "仅转写"], command=self._set_recording_mode, **selector_style)
+        self.mode_control.set("同传" if self.translate_recording else "仅转写")
+        self.mode_control.pack(side="left", padx=(8, 0))
+        self.action = label(strip, "", 11, SUB, anchor="w")
+        self.action.pack(anchor="w")
         self.live_link = button(strip, "回到录制", lambda: self.select_session(self.session_id), 68, fill=SELECT)
         self.orb = RecordOrb(dock, self.orbs, self.main._get_widget_scaling(), PAPER, self.toggle)
         self.orb.grid(row=1, column=1, padx=3, pady=3)
 
+    def _set_capture_source(self, value):
+        self.capture_source = "system" if value == "系统声音" else "mic"
+        self.history_store.set_preference("capture_source", self.capture_source)
+
+    def _set_recording_mode(self, value):
+        self.translate_recording = value == "同传"
+        self.history_store.set_preference("translate_recording", str(int(self.translate_recording)))
+
     def _dock_state(self):
+        state = "disabled" if self.recording or self.start_request or self.closing else "normal"
+        self.source_control.configure(state=state)
+        self.mode_control.configure(state=state)
         text = "点击头像暂停" if self.recording else "点击头像继续" if self.view_id else "点击头像录制"
         starting = self.start_request is not None and not self.start_request.cancelled.is_set()
         if self.start_request is not None:
@@ -534,11 +566,11 @@ class InterpreterWindow(ctk.CTk):
                 menu.configure(state="disabled" if self.recording or self.start_request else "normal")
         if self.recording and self.view_id != self.session_id:
             self.action.pack_forget()
-            self.live_link.pack(side="left")
+            self.live_link.pack(anchor="w")
         else:
             self.live_link.pack_forget()
             if not self.action.winfo_manager():
-                self.action.pack(side="left", fill="x", expand=True)
+                self.action.pack(anchor="w")
 
     def toggle_history(self):
         self.set_panel(None if self.panel == "history" else "history")
@@ -682,8 +714,12 @@ class InterpreterWindow(ctk.CTk):
         self.history_store.set_preference("overlay_caption_language", self.overlay_caption_language)
         self._refresh_overlay_subtitle()
 
-    def _show_overlay_translation(self, translated, original=""):
+    def _show_overlay_translation(self, translated, original="", *, transcript_only=False):
         translated, original = translated.strip(), original.strip()
+        if transcript_only:
+            self.overlay_captions = {"zh": original, "en": original}
+            self._refresh_overlay_subtitle()
+            return
         # The translation targets the opposite language. Prefer its language when available.
         sample = translated or original
         han = sum("\u3400" <= char <= "\u9fff" for char in sample)
@@ -1476,7 +1512,7 @@ class InterpreterWindow(ctk.CTk):
             self.scroll.pack_forget()
             self.transcript.pack_forget()
             self.empty_title.configure(text="正在聆听" if self.recording and sid == self.session_id else "开始一段同传" if sid is None else "暂无字幕")
-            self.empty_hint.configure(text="识别到的原文和译文会逐段显示" if self.recording and sid == self.session_id else
+            self.empty_hint.configure(text="识别到的文字会逐段显示" if self.recording and sid == self.session_id else
                                       "原文与译文将在这里逐段显示" if sid is None else "这段会话还没有已保存的内容")
             self.empty.place(relx=.5, rely=.48, anchor="center")
         self.transcript.yview_moveto(1. if sid == self.session_id else 0.)
@@ -1509,8 +1545,10 @@ class InterpreterWindow(ctk.CTk):
         if ended:
             stamp += datetime.fromtimestamp(ended).strftime("  –  %H:%M:%S")
         box.insert("end-1c", stamp + "\n", "stamp")
-        translation = translated or ("本段未取得译文" if final else "翻译中…")
+        translation = translated or ("" if final else "翻译中…")
         for text, tag in ((original, "original"), (translation, "translation")):
+            if not text:
+                continue
             for part in re.split(r"([A-Za-z][A-Za-z0-9 ,.'’:/()!?-]*)", text):
                 if part:
                     tags = (tag, "english") if part[0].isascii() and part[0].isalpha() else (tag,)
@@ -1578,35 +1616,44 @@ class InterpreterWindow(ctk.CTk):
             return
 
         device = self.devices.get(self.device.get())
-        if device is None:
+        if self.capture_source == "mic" and device is None:
             self._start_failed("请选择可用的麦克风", "录制")
             return
-        request = self.start_request = CaptureStart(self.view_id, self.draft_project, self.draft_title)
-        self.status.set("正在启动麦克风…")
+        request = self.start_request = CaptureStart(self.view_id, self.draft_project, self.draft_title,
+                                                    self.capture_source, self.translate_recording)
+        source_label = "系统声音" if request.source == "system" else "麦克风"
+        self.status.set(f"正在启动{source_label}…")
         self._dock_state()
         candidates = list(self.priority)
         threading.Thread(target=self._open_capture, args=(request, candidates, device),
-                         name="microphone-start", daemon=True).start()
+                         name="audio-start", daemon=True).start()
         self.after(25, self._finish_capture_start)
 
     def _open_capture(self, request, candidates, device):
         stream = None
-        try:
-            keys = {key: keyring.get_password(SERVICE, key) for name in candidates for key in KEYS[name]}
-        except Exception:
-            request.result.put((None, None, "无法读取 Windows 凭据，请检查设置", "翻译服务"))
-            return
-        routes = [name for name in candidates if all(keys[key] for key in KEYS[name])]
-        if not routes:
-            request.result.put((None, None, "请在「翻译服务」填写密钥", "翻译服务"))
-            return
+        keys, routes = {}, []
+        if request.translation_enabled:
+            try:
+                keys = {key: keyring.get_password(SERVICE, key) for name in candidates for key in KEYS[name]}
+            except Exception:
+                request.result.put((None, None, "无法读取 Windows 凭据，请检查设置", "翻译服务"))
+                return
+            routes = [name for name in candidates if all(keys[key] for key in KEYS[name])]
+            if not routes:
+                request.result.put((None, None, "请在「翻译服务」填写密钥", "翻译服务"))
+                return
         if request.cancelled.is_set():
             request.result.put((None, None, None, None))
             return
-        run = RecordingRun(self.history_store, keys, routes)
+        run = RecordingRun(self.history_store, keys, routes, request.translation_enabled)
         try:
-            stream = sd.RawInputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
-                                       blocksize=FRAME_SAMPLES, device=device, callback=run.capture)
+            if request.source == "system":
+                from system_audio import SystemAudioStream
+
+                stream = SystemAudioStream(run.capture)
+            else:
+                stream = sd.RawInputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
+                                           blocksize=FRAME_SAMPLES, device=device, callback=run.capture)
             if request.cancelled.is_set():
                 stream.close()
                 request.result.put((None, None, None, None))
@@ -1667,7 +1714,8 @@ class InterpreterWindow(ctk.CTk):
         self.partial = ("", "")
         if new:
             self._add_recording_row(sid, request.project_id)
-        self.status.set("正在收音 · 停顿 1 秒后翻译")
+        mode = "同传" if run.translation_enabled else "本地转写"
+        self.status.set(f"正在收音 · {mode}")
         if self.view_id == request.sid:
             if new:
                 self._select(sid)
@@ -1676,7 +1724,8 @@ class InterpreterWindow(ctk.CTk):
                 self.transcript.yview_moveto(1)
                 if not self.has_text:
                     self.empty_title.configure(text="正在聆听")
-                    self.empty_hint.configure(text="识别到的原文和译文会逐段显示")
+                    self.empty_hint.configure(text="识别到的原文和译文会逐段显示" if run.translation_enabled
+                                              else "识别到的文字会逐段保存")
         self._dock_state()
         threading.Thread(target=run.process, daemon=True).start()
 
@@ -1702,8 +1751,8 @@ class InterpreterWindow(ctk.CTk):
             self._dock_state()
             if self.view_id == run.session_id and not self.has_text:
                 self.empty_title.configure(text="已暂停收音")
-                self.empty_hint.configure(text="收到的译文会保存在本次会话")
-            self.status.set("已暂停收音 · 剩余译文在后台保存")
+                self.empty_hint.configure(text="收到的文字会保存在本次会话")
+            self.status.set("已暂停收音 · 剩余文字在后台保存")
 
     def _close_stream(self):
         if self.stream is not None:
@@ -1728,7 +1777,7 @@ class InterpreterWindow(ctk.CTk):
             if final:
                 self.history_store.append(sid, start, end, src, dst)
                 if sid == self.session_id:
-                    self._show_overlay_translation(dst, src)
+                    self._show_overlay_translation(dst, src, transcript_only=not run.translation_enabled)
             if self.view_id == sid:
                 self._write_segment(start, end, src, dst, final=final)
         elif e[0] == "status":
@@ -1745,7 +1794,7 @@ class InterpreterWindow(ctk.CTk):
             if not self.recording and self.view_id == sid:
                 self.partial = ("", "")
                 self._select(sid)
-                self.status.set(run.failure or ("已暂停收音 · 剩余译文在后台保存" if self.pending_runs else "已暂停 · 已保存"))
+                self.status.set(run.failure or ("已暂停收音 · 剩余文字在后台保存" if self.pending_runs else "已暂停 · 已保存"))
 
     def poll(self):
         for run in list(self.pending_runs):
@@ -1772,10 +1821,10 @@ class InterpreterWindow(ctk.CTk):
         if self.start_request is not None:
             self.start_request.cancelled.set()
             self._dock_state()
-            self.status.set("正在关闭麦克风")
+            self.status.set("正在停止收音")
         elif self.pending_runs:
             self._dock_state()
-            self.status.set("已停止收音 · 完成剩余翻译后自动退出")
+            self.status.set("已停止收音 · 保存剩余文字后自动退出")
         elif self.exporting_project:
             self.status.set("完成项目导出后自动退出")
         else:
