@@ -37,6 +37,7 @@ class PauseDuringUploadTests(unittest.TestCase):
                 patch("routes.translate_segment", side_effect=translate), patch("routes.webrtcvad.Vad") as vad:
             vad.return_value.is_speech.side_effect = lambda frame, rate: frame.startswith(b"B")
             db = HistoryStore(Path(tmp) / "test.db")
+            db.set_preference("capture_source", "mic")
             db.set_preference("priority", "腾讯云|Kimi 订阅|DeepSeek")
             db.set_preference("translation_cadence", "腾讯云 实时")
             app = InterpreterWindow(db)
