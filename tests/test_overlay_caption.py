@@ -130,9 +130,14 @@ class OverlayCaptionTests(unittest.TestCase):
                 on_icon = app.translation_icons[True]
                 off_icon = app.translation_icons[False]
                 self.assertIs(translation.cget("image"), on_icon)
-                self.assertEqual(on_icon.cget("size"), (10, 10))
-                self.assertEqual(on_icon.cget("light_image").getpixel((20, 20)), (39, 147, 94, 255))
-                self.assertEqual(off_icon.cget("light_image").getpixel((20, 20))[3], 0)
+                self.assertEqual(on_icon.cget("size"), (36, 18))
+                self.assertEqual(off_icon.cget("size"), (36, 18))
+                on_image = on_icon.cget("light_image")
+                off_image = off_icon.cget("light_image")
+                self.assertEqual(on_image.getpixel((35, 35)), (51, 135, 111, 255))
+                self.assertEqual(on_image.getpixel((107, 35)), (220, 239, 232, 255))
+                self.assertEqual(off_image.getpixel((35, 35)), (233, 237, 242, 255))
+                self.assertEqual(off_image.getpixel((107, 35)), (255, 255, 255, 255))
                 # A native click on the label must toggle only once, even with the menu grab.
                 toggle_label = next(child for child in translation.winfo_children()
                                     if child.winfo_class() == "Label")

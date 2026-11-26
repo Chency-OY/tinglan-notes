@@ -112,14 +112,15 @@ def button(parent, text, command, width=32, *, symbol=False, fill="transparent",
 
 
 def translation_indicator(enabled):
-    image = Image.new("RGBA", (40, 40))
+    image = Image.new("RGBA", (144, 72))
     draw = ImageDraw.Draw(image)
-    bounds = (2, 2, 37, 37)
+    track = "#DCEFE8" if enabled else "#E9EDF2"
+    draw.rounded_rectangle((1, 1, 142, 70), radius=35, fill=track)
     if enabled:
-        draw.ellipse(bounds, fill="#27935E")
+        draw.ellipse((10, 10, 61, 61), fill="#33876F")
     else:
-        draw.ellipse(bounds, outline="#8794A6", width=4)
-    return ctk.CTkImage(light_image=image, size=(10, 10))
+        draw.ellipse((82, 10, 133, 61), fill="#FFFFFF", outline="#8592A3", width=4)
+    return ctk.CTkImage(light_image=image, size=(36, 18))
 
 
 def orb_image(portrait, recording):
@@ -566,7 +567,7 @@ class InterpreterWindow(ctk.CTk):
         return ctk.CTkButton(
             parent, text="翻译", font=font(12), image=self.translation_icons[self.translate_recording],
             command=self._toggle_translation, state=self._capture_controls_state(),
-            compound="left", anchor="w", width=58, height=26, corner_radius=6, border_spacing=4,
+            compound="left", anchor="w", width=84, height=28, corner_radius=6, border_spacing=4,
             fg_color="transparent", hover_color="#EEF2FB", text_color=INK, text_color_disabled=MUTED)
 
     def _set_capture_source(self, value):
