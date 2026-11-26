@@ -325,6 +325,7 @@ class InterpreterWindow(ctk.CTk):
         self.overlay_caption_enabled = self.history_store.preference("overlay_caption", "1") == "1"
         self.overlay = self.overlay_caption = None
         self.overlay_menu = None
+        self.overlay_recording_controls = ()
         self.overlay_subtitle = ""
         self.overlay_captions = {"zh": "", "en": ""}
         self.overlay_caption_language = self.history_store.preference("overlay_caption_language", "en")
@@ -393,6 +394,8 @@ class InterpreterWindow(ctk.CTk):
         source = self.history_store.preference("capture_source", default_source)
         self.capture_source = source if source in self.capture_sources else default_source
         self.translate_recording = self.history_store.preference("translate_recording", "1") == "1"
+        self.source_setting = tk.StringVar(self, self.capture_sources[self.capture_source])
+        self.translation_setting = tk.IntVar(self, int(self.translate_recording))
         self._build_dock()
         self._select(None)
         self.bind("<Control-MouseWheel>", self._zoom)
@@ -523,23 +526,11 @@ class InterpreterWindow(ctk.CTk):
         self.notice.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 3))
         strip = ctk.CTkFrame(dock, fg_color="transparent")
         strip.grid(row=1, column=0, sticky="ew", padx=(4, 6))
-        self.source_control = ctk.CTkSegmentedButton(
-            strip, values=list(self.capture_sources.values()), command=self._set_capture_source,
-            font=font(12), height=29, corner_radius=9, fg_color="#EEF2FB",
-            selected_color=SELECT, selected_hover_color="#CCDAF4",
-            unselected_color="#EEF2FB", unselected_hover_color="#E5ECF9",
-            text_color=INK, text_color_disabled=MUTED)
-        self.source_control.set(self.capture_sources[self.capture_source])
+        self.source_control = self._capture_source_selector(strip)
         self.source_control.pack(anchor="w", pady=(2, 4))
         self.record_options = ctk.CTkFrame(strip, fg_color="transparent")
         self.record_options.pack(anchor="w")
-        self.mode_control = ctk.CTkSwitch(
-            self.record_options, text="翻译", font=font(12), command=self._set_recording_mode,
-            width=72, height=23, switch_width=36, switch_height=19, border_width=1,
-            fg_color="#B5C1D1", progress_color="#27935E", button_color="#FFFFFF",
-            button_hover_color="#F2F7F4", text_color=INK, text_color_disabled=MUTED)
-        if self.translate_recording:
-            self.mode_control.select()
+        self.mode_control = self._translation_switch(self.record_options)
         self.mode_control.pack(side="left", padx=(0, 8))
         self.action = label(self.record_options, "", 11, SUB, anchor="w")
         self.action.pack(side="left")
@@ -548,18 +539,38 @@ class InterpreterWindow(ctk.CTk):
         self.orb = RecordOrb(dock, self.orbs, self.main._get_widget_scaling(), PAPER, self.toggle)
         self.orb.grid(row=1, column=1, padx=3, pady=3)
 
+    def _capture_controls_state(self):
+        return "disabled" if self.recording or self.start_request or self.closing else "normal"
+
+    def _capture_source_selector(self, parent):
+        return ctk.CTkSegmentedButton(
+            parent, values=list(self.capture_sources.values()), variable=self.source_setting,
+            command=self._set_capture_source, state=self._capture_controls_state(),
+            font=font(12), height=29, corner_radius=9, fg_color="#EEF2FB",
+            selected_color=SELECT, selected_hover_color="#CCDAF4",
+            unselected_color="#EEF2FB", unselected_hover_color="#E5ECF9",
+            text_color=INK, text_color_disabled=MUTED)
+
+    def _translation_switch(self, parent):
+        return ctk.CTkSwitch(
+            parent, text="翻译", font=font(12), variable=self.translation_setting,
+            command=self._set_recording_mode, state=self._capture_controls_state(),
+            width=72, height=23, switch_width=36, switch_height=19, border_width=1,
+            fg_color="#B5C1D1", progress_color="#27935E", button_color="#FFFFFF",
+            button_hover_color="#F2F7F4", text_color=INK, text_color_disabled=MUTED)
+
     def _set_capture_source(self, value):
         self.capture_source = next(source for source, label in self.capture_sources.items() if label == value)
         self.history_store.set_preference("capture_source", self.capture_source)
 
     def _set_recording_mode(self):
-        self.translate_recording = bool(self.mode_control.get())
+        self.translate_recording = bool(self.translation_setting.get())
         self.history_store.set_preference("translate_recording", str(int(self.translate_recording)))
 
     def _dock_state(self):
-        state = "disabled" if self.recording or self.start_request or self.closing else "normal"
-        self.source_control.configure(state=state)
-        self.mode_control.configure(state=state)
+        state = self._capture_controls_state()
+        for control in (self.source_control, self.mode_control, *self.overlay_recording_controls):
+            control.configure(state=state)
         text = "点击头像暂停" if self.recording else "点击头像继续" if self.view_id else "点击头像录制"
         starting = self.start_request is not None and not self.start_request.cancelled.is_set()
         if self.start_request is not None:
@@ -616,6 +627,7 @@ class InterpreterWindow(ctk.CTk):
     def _close_overlay_menu(self):
         if self.overlay_menu is not None:
             menu, self.overlay_menu = self.overlay_menu, None
+            self.overlay_recording_controls = ()
             menu.destroy()
 
     def _show_overlay_menu(self, event):
@@ -635,6 +647,15 @@ class InterpreterWindow(ctk.CTk):
         card = ctk.CTkFrame(menu, bg_color=chroma, fg_color=surface, border_color=BORDER,
                             border_width=1, corner_radius=14)
         card.pack(fill="both", expand=True)
+        settings = ctk.CTkFrame(card, fg_color="#F7F9FD", corner_radius=10)
+        settings.pack(fill="x", padx=7, pady=(7, 2))
+        label(settings, "录制音源", 11, SUB, anchor="w").pack(anchor="w", padx=8, pady=(6, 3))
+        source_control = self._capture_source_selector(settings)
+        source_control.pack(fill="x", padx=8)
+        mode_control = self._translation_switch(settings)
+        mode_control.pack(anchor="w", padx=8, pady=(6, 6))
+        self.overlay_recording_controls = (source_control, mode_control)
+
         caption_action = "隐藏字幕" if self.overlay_caption_enabled else "显示字幕"
         language_action = "切换到中文字幕" if self.overlay_caption_language == "en" else "切换到英文字幕"
         choices = ((caption_action, self.toggle_overlay_caption, INK, "#EEF2FB"),
@@ -649,12 +670,15 @@ class InterpreterWindow(ctk.CTk):
         controls = []
         for text, command, color, hover in choices:
             control = ctk.CTkButton(card, text=text, command=lambda run=command: activate(run),
-                                    width=184, height=46, corner_radius=9, border_spacing=13,
+                                    width=184, height=38, corner_radius=9, border_spacing=10,
                                     anchor="w", fg_color="transparent", hover_color=hover,
-                                    text_color=color, font=font(17))
+                                    text_color=color, font=font(15))
             control.pack(fill="x", padx=6, pady=(6 if not controls else 2, 4))
             controls.append(control)
 
+        click_targets = [(segment, segment.invoke) for segment in source_control.grid_slaves(row=0)]
+        click_targets.append((mode_control, mode_control.toggle))
+        click_targets.extend((control, control.invoke) for control in controls)
         selected = None
 
         def select(step):
@@ -682,12 +706,16 @@ class InterpreterWindow(ctk.CTk):
                 return dismiss(event)
 
             if event.num == 1:
-                for control in controls:
+                for control, invoke in click_targets:
                     x, y = control.winfo_rootx(), control.winfo_rooty()
                     if (x <= event.x_root < x + control.winfo_width()
                             and y <= event.y_root < y + control.winfo_height()):
-                        control.invoke()
-                        return "break"
+                        # The control normally receives clicks on its child canvas or label.
+                        # A grab may instead deliver the press to the menu itself.
+                        if not str(event.widget).startswith(f"{control}."):
+                            invoke()
+                            return "break"
+                        return
 
         def dismiss_if_inactive():
             if self.overlay_menu is menu and menu.focus_displayof() is None:

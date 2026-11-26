@@ -94,3 +94,61 @@ class OverlayCaptionTests(unittest.TestCase):
                 for callback in app.tk.splitlist(app.tk.call("after", "info")):
                     app.after_cancel(callback)
                 app.destroy()
+
+
+    def test_popup_recording_controls_share_main_window_preferences(self):
+        with tempfile.TemporaryDirectory() as folder, patch("ctk_app.sd.query_devices", return_value=[]):
+            store = HistoryStore(Path(folder) / "test.db")
+            app = InterpreterWindow(store)
+            try:
+                app.update()
+                orb = app.float_canvas
+                orb.event_generate("<ButtonRelease-3>", x=10, y=10,
+                                   rootx=orb.winfo_rootx() + 10, rooty=orb.winfo_rooty() + 10)
+                app.update()
+                menu = app.overlay_menu
+                sources, translation = app.overlay_recording_controls
+
+                def click_via_grab(control):
+                    x = control.winfo_rootx() + control.winfo_width() // 2
+                    y = control.winfo_rooty() + control.winfo_height() // 2
+                    menu.event_generate("<ButtonPress-1>", rootx=x, rooty=y)
+                    self.assertIs(app.overlay_menu, menu)
+
+                self.assertEqual(sources.get(), app.source_control.get())
+                system = next((item for item in sources.grid_slaves(row=0) if item.cget("text") == "系统声音"),
+                              None)
+                if system is not None:
+                    click_via_grab(system)
+                    self.assertEqual(app.source_control.get(), "系统声音")
+                    self.assertEqual(store.preference("capture_source", ""), "system")
+                    microphone = next(item for item in app.source_control.grid_slaves(row=0)
+                                      if item.cget("text") == "麦克风")
+                    microphone.invoke()
+                    self.assertEqual(sources.get(), "麦克风")
+
+                self.assertEqual(translation.get(), 1)
+                # A native click on the label must toggle only once, even with the menu grab.
+                switch_label = next(child for child in translation.winfo_children()
+                                    if child.winfo_class() == "Label")
+                switch_label.event_generate("<ButtonPress-1>", x=1, y=1,
+                                            rootx=switch_label.winfo_rootx() + 1,
+                                            rooty=switch_label.winfo_rooty() + 1)
+                self.assertEqual(app.mode_control.get(), 0)
+                self.assertFalse(app.translate_recording)
+                self.assertEqual(store.preference("translate_recording", ""), "0")
+                click_via_grab(translation)
+                self.assertEqual(app.mode_control.get(), 1)
+                self.assertTrue(app.translate_recording)
+
+                app.recording = True
+                app._dock_state()
+                self.assertEqual(sources.cget("state"), "disabled")
+                self.assertEqual(translation.cget("state"), "disabled")
+                click_via_grab(translation)
+                self.assertEqual(app.mode_control.get(), 1)
+            finally:
+                app.close_overlay()
+                for callback in app.tk.splitlist(app.tk.call("after", "info")):
+                    app.after_cancel(callback)
+                app.destroy()
