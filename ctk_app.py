@@ -323,6 +323,10 @@ class InterpreterWindow(ctk.CTk):
         self.overlay = self.overlay_caption = None
         self.overlay_menu = None
         self.overlay_subtitle = ""
+        self.overlay_captions = {"zh": "", "en": ""}
+        self.overlay_caption_language = self.history_store.preference("overlay_caption_language", "en")
+        if self.overlay_caption_language not in self.overlay_captions:
+            self.overlay_caption_language = "en"
         self.ball_position = self._load_ball_position()
         self.overlay_alpha_percent = self._bounded_preference("overlay_alpha", 90, 55, 100)
         self.draft_title = ""
@@ -592,7 +596,9 @@ class InterpreterWindow(ctk.CTk):
                             border_width=1, corner_radius=14)
         card.pack(fill="both", expand=True)
         caption_action = "隐藏字幕" if self.overlay_caption_enabled else "显示字幕"
+        language_action = "切换到中文字幕" if self.overlay_caption_language == "en" else "切换到英文字幕"
         choices = ((caption_action, self.toggle_overlay_caption, INK, "#EEF2FB"),
+                   (language_action, self._switch_overlay_caption_language, INK, "#EEF2FB"),
                    ("关闭悬浮球", self.hide_overlay, INK, "#EEF2FB"),
                    ("退出", self.close, "#A24460", "#FAEDF2"))
 
@@ -671,8 +677,24 @@ class InterpreterWindow(ctk.CTk):
         menu.focus_force()
         menu.grab_set()
 
-    def _show_overlay_translation(self, text):
-        text = text.strip()
+    def _switch_overlay_caption_language(self):
+        self.overlay_caption_language = "zh" if self.overlay_caption_language == "en" else "en"
+        self.history_store.set_preference("overlay_caption_language", self.overlay_caption_language)
+        self._refresh_overlay_subtitle()
+
+    def _show_overlay_translation(self, translated, original=""):
+        translated, original = translated.strip(), original.strip()
+        # The translation targets the opposite language. Prefer its language when available.
+        sample = translated or original
+        han = sum("\u3400" <= char <= "\u9fff" for char in sample)
+        latin = sum(char.isascii() and char.isalpha() for char in sample)
+        language = "zh" if han and han >= latin else "en"
+        other = "en" if language == "zh" else "zh"
+        self.overlay_captions = {language: sample, other: original if translated else ""}
+        self._refresh_overlay_subtitle()
+
+    def _refresh_overlay_subtitle(self):
+        text = self.overlay_captions[self.overlay_caption_language]
         if text == self.overlay_subtitle:
             return
         self.overlay_subtitle = text
@@ -1705,8 +1727,8 @@ class InterpreterWindow(ctk.CTk):
                 self.partial = ("", "") if final else (src, dst)
             if final:
                 self.history_store.append(sid, start, end, src, dst)
-                if sid == self.session_id and dst.strip():
-                    self._show_overlay_translation(dst)
+                if sid == self.session_id:
+                    self._show_overlay_translation(dst, src)
             if self.view_id == sid:
                 self._write_segment(start, end, src, dst, final=final)
         elif e[0] == "status":

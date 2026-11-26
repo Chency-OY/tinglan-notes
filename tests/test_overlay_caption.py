@@ -18,12 +18,12 @@ class OverlayCaptionTests(unittest.TestCase):
                 caption = app.overlay_caption
                 self.assertFalse(caption.winfo_ismapped())
 
-                def caption_action():
+                def caption_action(index=0):
                     orb.event_generate("<ButtonRelease-3>", x=10, y=10,
                                        rootx=orb.winfo_rootx() + 10, rooty=orb.winfo_rooty() + 10)
                     app.update()
                     card, = app.overlay_menu.winfo_children()
-                    return next(button for button in card.winfo_children() if hasattr(button, "invoke"))
+                    return [button for button in card.winfo_children() if hasattr(button, "invoke")][index]
 
                 def click_caption_action(action, *, move_focus=False):
                     menu = app.overlay_menu
@@ -37,7 +37,7 @@ class OverlayCaptionTests(unittest.TestCase):
                     menu.event_generate("<ButtonPress-1>", rootx=x, rooty=y)
                     self.assertIsNone(app.overlay_menu)
 
-                segment = "这是字幕换行测试。 " * 14 + "The complete translation stays in one card."
+                segment = "This sentence tests subtitle wrapping. " * 14 + "The complete translation stays in one card."
                 app._show_overlay_translation(segment)
                 app.update()
                 body = caption.body
@@ -60,7 +60,7 @@ class OverlayCaptionTests(unittest.TestCase):
                 self.assertTrue(orb.winfo_ismapped())
                 self.assertEqual(store.preference("overlay_caption", "1"), "0")
 
-                app._show_overlay_translation("下一段译文")
+                app._show_overlay_translation("Next translation", "下一段原文")
                 app.update()
                 self.assertFalse(caption.winfo_ismapped())
                 action = caption_action()
@@ -68,8 +68,23 @@ class OverlayCaptionTests(unittest.TestCase):
                 click_caption_action(action)
                 app.update()
                 self.assertTrue(caption.winfo_ismapped())
-                self.assertEqual(body.cget("text"), "下一段译文")
+                self.assertEqual(body.cget("text"), "Next translation")
                 self.assertEqual(store.preference("overlay_caption", "0"), "1")
+
+                action = caption_action(1)
+                self.assertEqual(action.cget("text"), "切换到中文字幕")
+                click_caption_action(action)
+                app.update()
+                self.assertEqual(body.cget("text"), "下一段原文")
+                self.assertEqual(store.preference("overlay_caption_language", "en"), "zh")
+
+                app._show_overlay_translation("这是下一段译文", "This is the next original segment.")
+                self.assertEqual(body.cget("text"), "这是下一段译文")
+                action = caption_action(1)
+                self.assertEqual(action.cget("text"), "切换到英文字幕")
+                click_caption_action(action)
+                app.update()
+                self.assertEqual(body.cget("text"), "This is the next original segment.")
 
                 app._show_overlay_translation("")
                 app.update()
