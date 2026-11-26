@@ -17,11 +17,11 @@ import keyring
 import sounddevice as sd
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from interpreter import FRAME_SAMPLES, SAMPLE_RATE, SERVICE, HistoryStore, Interpreter as AudioBackend, clock_text, safe_filename
+from interpreter import (APP_TITLE, FRAME_SAMPLES, SAMPLE_RATE, SERVICE, HistoryStore,
+                         Interpreter as AudioBackend, clock_text, safe_filename)
 from routes import KEYS, priority_loop, priority_order
 from window_chrome import WindowsTitleStrip, main_frame_handle, show_main_on_taskbar
 
-APP_TITLE = "中英同传字幕"
 PAPER = "#FAFBFE"
 SIDE = "#EEF2FB"
 INK = "#303B59"
@@ -117,9 +117,9 @@ def translation_indicator(enabled):
     track = "#DCEFE8" if enabled else "#E9EDF2"
     draw.rounded_rectangle((1, 1, 142, 70), radius=35, fill=track)
     if enabled:
-        draw.ellipse((10, 10, 61, 61), fill="#33876F")
+        draw.ellipse((82, 10, 133, 61), fill="#33876F")
     else:
-        draw.ellipse((82, 10, 133, 61), fill="#FFFFFF", outline="#8592A3", width=4)
+        draw.ellipse((10, 10, 61, 61), fill="#FFFFFF", outline="#8592A3", width=4)
     return ctk.CTkImage(light_image=image, size=(36, 18))
 
 
@@ -943,7 +943,7 @@ class InterpreterWindow(ctk.CTk):
         self.side.grid(row=self.content_row, column=0, sticky="ns")
         row = ctk.CTkFrame(self.side, fg_color="transparent")
         row.pack(fill="x", padx=(15, 9), pady=(10, 4))
-        label(row, "会话" if self.title_strip is not None else "中英同传", 13, bold=True).pack(side="left")
+        label(row, "会话" if self.title_strip is not None else APP_TITLE, 13, bold=True).pack(side="left")
         close = button(row, "", lambda: self.set_panel(None), 28)
         close.configure(image=sidebar_icon())
         close.pack(side="right")
@@ -1576,7 +1576,7 @@ class InterpreterWindow(ctk.CTk):
 
     def _header_state(self):
         info = self.history_store.session(self.view_id) if self.view_id else None
-        self.heading.configure(text=self.history_store.title(self.view_id) if info else self.draft_title or "中英同传")
+        self.heading.configure(text=self.history_store.title(self.view_id) if info else self.draft_title or APP_TITLE)
         if info:
             start = datetime.fromtimestamp(info[1])
             end = datetime.fromtimestamp(info[2]) if info[2] else None
@@ -1911,7 +1911,8 @@ def main():
             windows.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
             windows.FindWindowW.restype = wintypes.HWND
             for _ in range(40):
-                hwnd = windows.FindWindowW("TkTopLevel", APP_TITLE)
+                hwnd = (windows.FindWindowW("TkTopLevel", APP_TITLE)
+                        or windows.FindWindowW("TkTopLevel", "中英同传字幕"))
                 if hwnd:
                     show_main_on_taskbar(hwnd, activate=True)
                     break

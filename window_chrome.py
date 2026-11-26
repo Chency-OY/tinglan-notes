@@ -342,7 +342,7 @@ class WindowsTitleStrip(tk.Canvas):
             self.create_line(x, middle - line_height * scale / 2, x, middle + line_height * scale / 2,
                              fill="#5073B3", width=max(1, round(1.5 * scale)), capstyle="round")
         x = 43 * scale
-        for character in "中英同传":
+        for character in self.master.title():
             self.create_text(x, middle, text=character, font=self.caption_font, fill="#293955", anchor="w")
             x += self.caption_font.measure(character) + max(1, round(self.scale))
 

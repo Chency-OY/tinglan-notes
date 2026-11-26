@@ -23,6 +23,7 @@ import keyring
 import numpy as np
 import sounddevice as sd
 
+APP_TITLE = "听澜笔记"
 SERVICE = "zh-en-live-interpreter"
 SAMPLE_RATE = 16000
 FRAME_SAMPLES = 3200  # 200 ms
@@ -281,7 +282,7 @@ class PillButton(tk.Canvas):
 class Interpreter(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("中英同传字幕")
+        self.title(APP_TITLE)
         icon_path = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "icon.ico"
         if icon_path.exists():
             self.iconbitmap(str(icon_path))
