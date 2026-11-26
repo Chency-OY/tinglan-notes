@@ -386,8 +386,12 @@ class InterpreterWindow(ctk.CTk):
         self.main.grid_rowconfigure(1, weight=1)
         self._build_header()
         self._build_feed()
-        source = self.history_store.preference("capture_source", "mic")
-        self.capture_source = "system" if sys.platform == "win32" and source == "system" else "mic"
+        self.capture_sources = {"mic": "麦克风"}
+        if sys.platform == "win32":
+            self.capture_sources = {"both": "内外同时", "system": "系统声音", **self.capture_sources}
+        default_source = next(iter(self.capture_sources))
+        source = self.history_store.preference("capture_source", default_source)
+        self.capture_source = source if source in self.capture_sources else default_source
         self.translate_recording = self.history_store.preference("translate_recording", "1") == "1"
         self._build_dock()
         self._select(None)
@@ -519,33 +523,37 @@ class InterpreterWindow(ctk.CTk):
         self.notice.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 3))
         strip = ctk.CTkFrame(dock, fg_color="transparent")
         strip.grid(row=1, column=0, sticky="ew", padx=(4, 6))
-        controls = ctk.CTkFrame(strip, fg_color="transparent")
-        controls.pack(anchor="w", pady=(2, 4))
-        sources = ["麦克风", "系统声音"] if sys.platform == "win32" else ["麦克风"]
-        selector_style = dict(font=font(12), height=30, corner_radius=9,
-                              fg_color="#EEF2FB", selected_color=SELECT, selected_hover_color="#CCDAF4",
-                              unselected_color="#EEF2FB", unselected_hover_color="#E5ECF9",
-                              text_color=INK, text_color_disabled=MUTED)
         self.source_control = ctk.CTkSegmentedButton(
-            controls, values=sources, command=self._set_capture_source, **selector_style)
-        self.source_control.set("系统声音" if self.capture_source == "system" else "麦克风")
-        self.source_control.pack(side="left")
-        self.mode_control = ctk.CTkSegmentedButton(
-            controls, values=["同传", "仅转写"], command=self._set_recording_mode, **selector_style)
-        self.mode_control.set("同传" if self.translate_recording else "仅转写")
-        self.mode_control.pack(side="left", padx=(8, 0))
-        self.action = label(strip, "", 11, SUB, anchor="w")
-        self.action.pack(anchor="w")
-        self.live_link = button(strip, "回到录制", lambda: self.select_session(self.session_id), 68, fill=SELECT)
+            strip, values=list(self.capture_sources.values()), command=self._set_capture_source,
+            font=font(12), height=29, corner_radius=9, fg_color="#EEF2FB",
+            selected_color=SELECT, selected_hover_color="#CCDAF4",
+            unselected_color="#EEF2FB", unselected_hover_color="#E5ECF9",
+            text_color=INK, text_color_disabled=MUTED)
+        self.source_control.set(self.capture_sources[self.capture_source])
+        self.source_control.pack(anchor="w", pady=(2, 4))
+        self.record_options = ctk.CTkFrame(strip, fg_color="transparent")
+        self.record_options.pack(anchor="w")
+        self.mode_control = ctk.CTkSwitch(
+            self.record_options, text="翻译", font=font(12), command=self._set_recording_mode,
+            width=72, height=23, switch_width=36, switch_height=19, border_width=1,
+            fg_color="#B5C1D1", progress_color="#27935E", button_color="#FFFFFF",
+            button_hover_color="#F2F7F4", text_color=INK, text_color_disabled=MUTED)
+        if self.translate_recording:
+            self.mode_control.select()
+        self.mode_control.pack(side="left", padx=(0, 8))
+        self.action = label(self.record_options, "", 11, SUB, anchor="w")
+        self.action.pack(side="left")
+        self.live_link = button(self.record_options, "回到录制", lambda: self.select_session(self.session_id),
+                                68, fill=SELECT)
         self.orb = RecordOrb(dock, self.orbs, self.main._get_widget_scaling(), PAPER, self.toggle)
         self.orb.grid(row=1, column=1, padx=3, pady=3)
 
     def _set_capture_source(self, value):
-        self.capture_source = "system" if value == "系统声音" else "mic"
+        self.capture_source = next(source for source, label in self.capture_sources.items() if label == value)
         self.history_store.set_preference("capture_source", self.capture_source)
 
-    def _set_recording_mode(self, value):
-        self.translate_recording = value == "同传"
+    def _set_recording_mode(self):
+        self.translate_recording = bool(self.mode_control.get())
         self.history_store.set_preference("translate_recording", str(int(self.translate_recording)))
 
     def _dock_state(self):
@@ -566,11 +574,11 @@ class InterpreterWindow(ctk.CTk):
                 menu.configure(state="disabled" if self.recording or self.start_request else "normal")
         if self.recording and self.view_id != self.session_id:
             self.action.pack_forget()
-            self.live_link.pack(anchor="w")
+            self.live_link.pack(side="left")
         else:
             self.live_link.pack_forget()
             if not self.action.winfo_manager():
-                self.action.pack(anchor="w")
+                self.action.pack(side="left")
 
     def toggle_history(self):
         self.set_panel(None if self.panel == "history" else "history")
@@ -1616,13 +1624,12 @@ class InterpreterWindow(ctk.CTk):
             return
 
         device = self.devices.get(self.device.get())
-        if self.capture_source == "mic" and device is None:
+        if self.capture_source != "system" and device is None:
             self._start_failed("请选择可用的麦克风", "录制")
             return
         request = self.start_request = CaptureStart(self.view_id, self.draft_project, self.draft_title,
                                                     self.capture_source, self.translate_recording)
-        source_label = "系统声音" if request.source == "system" else "麦克风"
-        self.status.set(f"正在启动{source_label}…")
+        self.status.set(f"正在启动录制 · {self.capture_sources[request.source]}")
         self._dock_state()
         candidates = list(self.priority)
         threading.Thread(target=self._open_capture, args=(request, candidates, device),
@@ -1647,13 +1654,20 @@ class InterpreterWindow(ctk.CTk):
             return
         run = RecordingRun(self.history_store, keys, routes, request.translation_enabled)
         try:
+            def open_microphone(capture, blocksize=FRAME_SAMPLES):
+                return sd.RawInputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
+                                         blocksize=blocksize, device=device, callback=capture)
+
             if request.source == "system":
                 from system_audio import SystemAudioStream
 
                 stream = SystemAudioStream(run.capture)
+            elif request.source == "both":
+                from system_audio import MixedAudioStream
+
+                stream = MixedAudioStream(lambda capture: open_microphone(capture, SAMPLE_RATE // 50), run.capture)
             else:
-                stream = sd.RawInputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
-                                           blocksize=FRAME_SAMPLES, device=device, callback=run.capture)
+                stream = open_microphone(run.capture)
             if request.cancelled.is_set():
                 stream.close()
                 request.result.put((None, None, None, None))

@@ -114,3 +114,24 @@ class SpeechBatchTests(unittest.TestCase):
             translate_text(client,"Kimi 订阅","fixture","It binds the receptor.",("Insulin","胰岛素"))
         self.assertEqual([m["content"] for m in captured["messages"][1:]],
                          ["Insulin","胰岛素","It binds the receptor."])
+
+
+class MixedAudioTests(unittest.TestCase):
+    def test_mixes_inputs_without_waiting_for_silent_stream_and_keeps_tail(self):
+        from system_audio import PcmMixer
+
+        packets = []
+        mixer = PcmMixer(lambda data, frames, timing, status: packets.append(data))
+        mic = (26000).to_bytes(2, "little", signed=True)
+        system = (12000).to_bytes(2, "little", signed=True)
+        clipped = (32767).to_bytes(2, "little", signed=True)
+        block = mixer.BLOCK
+
+        mixer.add("mic", block, mic * block, "")
+        mixer.add("system", block, system * block, "")
+        for end in range(block * 2, mixer.BUFFER + block * 2, block):
+            mixer.add("mic", end, mic * block, "")
+        self.assertEqual(b"".join(packets), clipped * block)
+        mixer.add("mic", end + 11, mic * 11, "")
+        mixer.finish()
+        self.assertEqual(b"".join(packets), clipped * block + mic * (end + 11 - block))
